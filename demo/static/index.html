@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Articling Demo — Graph View</title>
+<link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css" />
+<link rel="stylesheet" href="/style.css" />
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+  <header id="topbar">
+    <button id="sidebarToggle" class="icon-btn" type="button" title="Toggle sessions sidebar" aria-label="Toggle sessions sidebar">☰</button>
+    <div class="brand"><strong>Articling</strong> <span class="muted">Graph Demo</span></div>
+
+    <div id="uploadArea">
+      <label class="upload-btn">
+        Select file
+        <input id="fileInput" type="file" accept=".docx,.pptx,.xlsx,.pdf" hidden />
+      </label>
+      <div id="vlmGroup" class="vlm-group">
+        <label class="checkbox-field" id="vlmLabel" title="Runs relations.propose.apply_vlm_enrichment (merge_fragmented_text + promote_heading_parents + nest_numbered_headings + propose_edges)">
+          <input id="vlmToggle" type="checkbox" checked />
+          VLM enrichment (headings + CAPTION_OF / REFERENCES)
+        </label>
+        <label class="checkbox-field" id="groupsLabel" title="Runs relations.propose.propose_synthetic_groups — creates a synthetic Group node for sibling content with no heading in the source (e.g. an author roster), opt-in like promote_heading_parents">
+          <input id="groupsToggle" type="checkbox" />
+          Synthetic groups (experimental)
+        </label>
+        <input
+          id="apiKeyInput"
+          class="api-key-input"
+          type="password"
+          placeholder="sk-... (this browser only)"
+          autocomplete="off"
+          spellcheck="false"
+          hidden
+          title="Sent only with this upload's request, never written to disk — kept in this tab's sessionStorage so you don't retype it."
+        />
+        <span id="vlmHint" class="muted" hidden></span>
+      </div>
+      <span id="fileMeta" class="muted"></span>
+    </div>
+
+    <div id="statusArea"></div>
+  </header>
+
+  <main id="split">
+    <aside id="sessionSidebar" class="pane sidebar">
+      <div class="pane-header">
+        <h2>Sessions <span class="muted" id="sessionCount"></span></h2>
+      </div>
+      <div class="pane-body" id="sessionList">
+        <div class="empty-hint sidebar-empty">
+          <p>No saved sessions yet.<br />Extract a file to create one.</p>
+        </div>
+      </div>
+    </aside>
+
+    <section id="rightPane" class="pane">
+      <div class="pane-header">
+        <h2>Graph result <span class="muted">ArticDocument</span></h2>
+        <div id="legend" class="legend" hidden>
+          <span class="legend-item"><i class="dot" style="background:var(--node-file)"></i>File</span>
+          <span class="legend-item"><i class="dot" style="background:var(--node-artifact)"></i>Artifact</span>
+          <span class="legend-item"><i class="dot" style="background:var(--node-text)"></i>Text</span>
+          <span class="legend-item"><i class="dot" style="background:var(--node-table)"></i>Table</span>
+          <span class="legend-item"><i class="dot" style="background:var(--node-image)"></i>Image</span>
+          <span class="legend-item"><i class="dot" style="background:var(--node-group)"></i>Group</span>
+          <span class="legend-sep"></span>
+          <span class="legend-item"><i class="line solid" style="background:var(--edge-parent)"></i>PARENT_OF</span>
+          <span class="legend-item"><i class="line dashed" style="border-color:var(--edge-next)"></i>NEXT</span>
+          <span class="legend-item"><i class="line dashed" style="border-color:var(--edge-caption)"></i>CAPTION_OF</span>
+          <span class="legend-item"><i class="line dotted" style="border-color:var(--edge-references)"></i>REFERENCES</span>
+        </div>
+      </div>
+
+      <div id="summaryBar" class="summary-bar" hidden></div>
+
+      <div class="pane-body" id="graphWrap">
+        <div id="graph"></div>
+        <div id="zoomControls" class="zoom-controls" hidden>
+          <button id="zoomIn" type="button" title="Zoom in">+</button>
+          <button id="zoomOut" type="button" title="Zoom out">−</button>
+          <button id="zoomFit" type="button" title="Fit whole graph">Fit</button>
+        </div>
+        <div id="graphEmpty" class="empty-hint">
+          <p>
+            Select a <strong>.docx / .pptx / .xlsx / .pdf</strong> file above.<br />
+            Once extraction finishes, the File → Artifact → Text/Table/Image graph
+            renders here. Click a node to see its detail. On large graphs, zoom in
+            (scroll, or the +/− buttons) to click individual nodes precisely.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <aside id="detailDrawer" class="drawer" hidden>
+      <button id="closeDrawer" class="close-btn" aria-label="Close">×</button>
+      <div id="detailContent"></div>
+    </aside>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

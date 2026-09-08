@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.env
+tests/fixtures/captures/
+examples/out/
+demo/.sessions/
+demo/__pycache__/
+*.cypher
+.pytest_cache/
+
+# Confidential test corpus and artifacts generated from it — never commit
+test_dataset_private/
+runs/
+tmp/
+
+# Internal research/experiment notes moved out of the README — not published
+Experiments.md
+
+.DS_Store

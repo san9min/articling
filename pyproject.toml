@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "articling"
+version = "0.1.0"
+description = "DOCX/PPTX/XLSX -> typed document graph (File/Artifact/Text/Table/Image), native-library extraction, Neo4j-ready."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "articling contributors" }]
+dependencies = [
+    "pydantic>=2",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "openpyxl>=3.1",
+    "Pillow>=10",
+    "pymupdf>=1.24",
+]
+
+[project.optional-dependencies]
+relations = ["openai>=1.40"]
+neo4j = ["neo4j>=5"]
+# Local-model backend for PDF table reading (relations/table_structure.py's
+# read_table_grid_granite_docling). Not needed if you only use the openai
+# backend — the `relations` extra alone is enough. torch/transformers are
+# heavy (hundreds of MB plus a 258M-parameter model download) — this is the
+# only place torch enters a project that otherwise avoids heavy packages
+# like docling, so opt in deliberately.
+pdf-tables-local = ["torch>=2", "transformers>=4.45", "docling-core>=2.80"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/san9min/articling"
+Repository = "https://github.com/san9min/articling"
+
+[project.scripts]
+articling = "articling.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["articling*"]
+
+[tool.setuptools.package-data]
+# Ship the usage skill (docling/AGENTS.md-style) inside the wheel/sdist so it
+# is discoverable once articling is installed. See AGENTS.md "Skills".
+articling = [".agents/skills/articling/SKILL.md", ".agents/skills/articling/references/*.md"]

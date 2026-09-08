@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "articling-demo",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["demo/app.py"],
+      "port": 8420
+    }
+  ]
+}
