@@ -2,6 +2,7 @@
 
 > **Turn documents into structured graphs.**
 
+[![Tests](https://github.com/san9min/articling/actions/workflows/tests.yml/badge.svg)](https://github.com/san9min/articling/actions/workflows/tests.yml)
 [![License MIT](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![Pydantic v2](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/pydantic/pydantic/main/docs/badge/v2.json)](https://pydantic.dev)

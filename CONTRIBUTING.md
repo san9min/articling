@@ -9,6 +9,9 @@ export code are expected to follow. This file covers the mechanics of
 getting a dev environment running and submitting a change; AGENTS.md covers
 the *shape* the code should take.
 
+Participation in this project is covered by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Developing
 
 ### Create an environment and install
