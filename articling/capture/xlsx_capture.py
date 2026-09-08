@@ -97,10 +97,20 @@ MAX_CELL_TEXT_CHARS = 300  # prevent slow rendering from a pathologically long c
 _FONT_REGULAR_CANDIDATES = [
     str(Path.home() / "Library/Fonts/NanumGothic-Regular.ttf"),
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+    # Linux fallback — these are hardcoded (not resolved via `fc-list`, unlike
+    # _find_font_file_for_family) because this is the last-resort glyph
+    # renderer, not the MDW-measurement path; DejaVu ships in the common
+    # `fonts-dejavu-core` package and covers Latin text passably. Without
+    # this, a Linux install with neither NanumGothic nor DejaVu falls all
+    # the way through to PIL's tiny fixed-size `ImageFont.load_default()`,
+    # which silently produces badly-sized captures (confirmed: CI's text
+    # size measurement diverges enough that fit-shrinking never triggers).
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ]
 _FONT_BOLD_CANDIDATES = [
     str(Path.home() / "Library/Fonts/NanumGothic-Bold.ttf"),
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",  # substitute the regular file if no bold file exists (faked bold below)
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 ]
 
 _DEFAULT_TEXT_RGB = (30, 30, 30)
