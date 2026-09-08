@@ -72,9 +72,7 @@ from ..capture.xlsx_capture import (
 )
 from ..capture.xlsx_chart_capture import extract_chart_data, parse_theme_colors, render_chart_image
 from ..schema import ArticDocument, Edge, Node, NodeType
-from ..scaffold import file_node, parent_edges, save_image_bytes
-
-CAPTURE_SUBDIR = "captures"
+from ..scaffold import file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
 
 def _table_ranges(ws) -> dict[tuple[int, int, int, int], str]:
@@ -359,7 +357,7 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
     choose the output location, since this is an open-source package.
     """
     wb = openpyxl.load_workbook(path, data_only=True)
-    capture_root = capture_dir if capture_dir is not None else path.parent / CAPTURE_SUBDIR
+    capture_root = resolve_capture_dir(path, capture_dir)
     # Resolved once per workbook — every chart's `schemeClr` styling shares
     # the same theme part, so there's no reason to reparse it per chart.
     theme_colors = parse_theme_colors(wb.loaded_theme)

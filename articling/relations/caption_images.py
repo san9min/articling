@@ -42,8 +42,7 @@ from pydantic import BaseModel, Field
 
 from .._image_util import encode_image_data_url
 from ..schema import ArticDocument, Node, NodeType
-
-DEFAULT_MODEL = "gpt-5.6-terra"
+from ._config import DEFAULT_MODEL
 
 _INSTRUCTIONS = """\
 Create a new searchable description for an image node stored in a document

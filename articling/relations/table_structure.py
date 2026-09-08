@@ -50,8 +50,9 @@ from ..extractors.pdf import _normalized_bbox, _resort_pdf_content_nodes
 from ..extractors.pdf_tables import TableCandidate, detect_table_candidates
 from ..scaffold import save_image_bytes
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
+from ._config import DEFAULT_MODEL
 
-DEFAULT_OPENAI_MODEL = "gpt-5.6-terra"
+DEFAULT_OPENAI_MODEL = DEFAULT_MODEL
 GRANITE_DOCLING_REPO_ID = "ibm-granite/granite-docling-258M"
 # The prompt settled on by empirical testing (2026-09-04) — the model
 # card's short instruction dedicated to "Table". "Convert this page to

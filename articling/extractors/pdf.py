@@ -66,11 +66,10 @@ from pathlib import Path
 
 import pymupdf
 
+from .._geometry import cluster_indices
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from ..scaffold import file_node, parent_edges, save_image_bytes
+from ..scaffold import caption_prefix_edges, file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
-_CAPTION_PREFIXES = ("표 ", "그림 ", "Table ", "Figure ", "<표", "<그림", "[표", "[그림")
-CAPTURE_SUBDIR = "captures"
 _LINE_Y_OVERLAP = 0.5  # y must overlap at least this much to count as "the same line" and get its x order fixed
 _LINE_MAX_HEIGHT = 30.0  # only considered a reorder candidate when both are at or under this height (pt) (explained below)
 
@@ -102,37 +101,17 @@ def _reorder_same_line_blocks(blocks: list[dict]) -> list[dict]:
     all 30pt or under, while paragraph/footnote/watermark blocks were 90pt
     or more — a wide enough gap."""
     n = len(blocks)
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int) -> None:
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[rx] = ry
 
     def _height(bbox: tuple[float, float, float, float]) -> float:
         return bbox[3] - bbox[1]
 
-    for i in range(n):
-        if _height(blocks[i]["bbox"]) > _LINE_MAX_HEIGHT:
-            continue
-        for j in range(i + 1, n):
-            if _height(blocks[j]["bbox"]) > _LINE_MAX_HEIGHT:
-                continue
-            if _y_overlap_frac(blocks[i]["bbox"], blocks[j]["bbox"]) >= _LINE_Y_OVERLAP:
-                union(i, j)
-
-    clusters: dict[int, list[int]] = {}
-    for i in range(n):
-        clusters.setdefault(find(i), []).append(i)
+    def connected(i: int, j: int) -> bool:
+        if _height(blocks[i]["bbox"]) > _LINE_MAX_HEIGHT or _height(blocks[j]["bbox"]) > _LINE_MAX_HEIGHT:
+            return False
+        return _y_overlap_frac(blocks[i]["bbox"], blocks[j]["bbox"]) >= _LINE_Y_OVERLAP
 
     result: list[dict | None] = [None] * n
-    for members in clusters.values():
+    for members in cluster_indices(n, connected):
         positions = sorted(members)  # the original slots (keeps document order)
         by_x = sorted(members, key=lambda i: blocks[i]["bbox"][0])  # the order to fill those slots (left to right)
         for pos, idx in zip(positions, by_x):
@@ -226,7 +205,7 @@ def extract(
     separate judgment with some false-positive risk (for the same reason as
     `enrich_tables`), so it keeps the explicit opt-in. Calling
     `pdf_figures.enrich_pdf_figures` directly gives the same result."""
-    capture_root = capture_dir if capture_dir is not None else path.parent / CAPTURE_SUBDIR
+    capture_root = resolve_capture_dir(path, capture_dir)
     pdf = pymupdf.open(str(path))
     file_n = file_node(path)
     artifact = Node(
@@ -294,20 +273,7 @@ def extract(
     nodes.extend(content_nodes)
     edges.extend(parent_edges(artifact, content_nodes))
 
-    # CAPTION_OF heuristic proposal (a proposal for human review — not final, same as docx.py/pptx.py)
-    for i, n in enumerate(content_nodes):
-        if n.type != NodeType.TEXT:
-            continue
-        text = n.properties.get("text", "")
-        if not text.startswith(_CAPTION_PREFIXES):
-            continue
-        neighbors = (
-            content_nodes[i - 1] if i > 0 else None,
-            content_nodes[i + 1] if i + 1 < len(content_nodes) else None,
-        )
-        for neighbor in neighbors:
-            if neighbor is not None and neighbor.type in (NodeType.TABLE, NodeType.IMAGE):
-                edges.append(Edge(type=EdgeType.CAPTION_OF, source_id=n.id, target_id=neighbor.id))
+    edges.extend(caption_prefix_edges(content_nodes))
 
     document = ArticDocument(source_path=str(path.resolve()), format="pdf", nodes=nodes, edges=edges)
 

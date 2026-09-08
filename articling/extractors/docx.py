@@ -32,10 +32,7 @@ from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from ..scaffold import file_node, parent_edges, save_image_bytes
-
-_CAPTION_PREFIXES = ("표 ", "그림 ", "Table ", "Figure ", "<표", "<그림", "[표", "[그림")
-CAPTURE_SUBDIR = "captures"
+from ..scaffold import caption_prefix_edges, file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
 
 def _paragraph_has_image(p: Paragraph) -> bool:
@@ -73,7 +70,7 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
     (default: `captures/` next to `path`). Same purpose as Table's visual
     capture (xlsx) — keeps the raw bytes around for a pixel-based
     post-process like a VLM caption."""
-    capture_root = capture_dir if capture_dir is not None else path.parent / CAPTURE_SUBDIR
+    capture_root = resolve_capture_dir(path, capture_dir)
     d = docx.Document(str(path))
     file_n = file_node(path)
     artifact = Node(
@@ -179,19 +176,6 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
     nodes.extend(content_nodes)
     edges.extend(parent_edges(artifact, content_nodes))
 
-    # CAPTION_OF heuristic proposal (a proposal for human review — not final)
-    for i, n in enumerate(content_nodes):
-        if n.type != NodeType.TEXT:
-            continue
-        text = n.properties.get("text", "")
-        if not text.startswith(_CAPTION_PREFIXES):
-            continue
-        neighbors = (
-            content_nodes[i - 1] if i > 0 else None,
-            content_nodes[i + 1] if i + 1 < len(content_nodes) else None,
-        )
-        for neighbor in neighbors:
-            if neighbor is not None and neighbor.type in (NodeType.TABLE, NodeType.IMAGE):
-                edges.append(Edge(type=EdgeType.CAPTION_OF, source_id=n.id, target_id=neighbor.id))
+    edges.extend(caption_prefix_edges(content_nodes))
 
     return ArticDocument(source_path=str(path.resolve()), format="docx", nodes=nodes, edges=edges)

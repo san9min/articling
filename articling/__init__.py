@@ -19,6 +19,7 @@ Quickstart:
 """
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 from .schema import ArticDocument, Edge, EdgeType, Node, NodeType
@@ -26,7 +27,18 @@ from .schema import ArticDocument, Edge, EdgeType, Node, NodeType
 __all__ = ["ArticDocument", "Edge", "EdgeType", "Node", "NodeType", "extract"]
 __version__ = "0.1.0"
 
-_EXTRACTORS_BY_SUFFIX = {".docx", ".pptx", ".xlsx", ".pdf"}
+# Single source of truth for suffix -> extractor module — used for both
+# dispatch and the "supported" list in the error message below, so adding a
+# format means editing this one mapping instead of an if/elif chain and its
+# error message separately. Each module is imported lazily (only once its
+# suffix actually matches) so `import articling` doesn't pull in every
+# format's dependencies up front.
+_EXTRACTOR_MODULES = {
+    ".docx": "articling.extractors.docx",
+    ".pptx": "articling.extractors.pptx",
+    ".xlsx": "articling.extractors.xlsx",
+    ".pdf": "articling.extractors.pdf",
+}
 
 
 def extract(path: str | Path) -> ArticDocument:
@@ -39,14 +51,7 @@ def extract(path: str | Path) -> ArticDocument:
     """
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix == ".docx":
-        from .extractors.docx import extract as _extract
-    elif suffix == ".pptx":
-        from .extractors.pptx import extract as _extract
-    elif suffix == ".xlsx":
-        from .extractors.xlsx import extract as _extract
-    elif suffix == ".pdf":
-        from .extractors.pdf import extract as _extract
-    else:
-        raise ValueError(f"Unsupported file extension: {suffix!r} (supported: {sorted(_EXTRACTORS_BY_SUFFIX)})")
-    return _extract(path)
+    module_name = _EXTRACTOR_MODULES.get(suffix)
+    if module_name is None:
+        raise ValueError(f"Unsupported file extension: {suffix!r} (supported: {sorted(_EXTRACTOR_MODULES)})")
+    return importlib.import_module(module_name).extract(path)

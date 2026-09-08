@@ -20,10 +20,21 @@ from pptx.oxml.ns import qn
 from pydantic import BaseModel, Field
 
 from ..extractors.pptx import _flatten_shapes, _ole_preview_image, _shape_slide_corners, _OLE_SHAPE_TYPES
-from .xlsx_capture import _find_font_file_for_family, _load_capture_font
+from .xlsx_capture import FALLBACK_FONT_PATHS, _find_font_file_for_family, _load_capture_font
 
 _EMU_PER_PT = 12700
 _MAX_LAYER_PIXELS = 20_000_000
+# Per-glyph fallback candidates, tried in order when the slide's own font is
+# missing a specific character (see `_glyph_font`). Reuses xlsx_capture's
+# shared last-resort font paths rather than hardcoding a second copy, with
+# one PPTX-specific addition: Apple Symbols covers glyphs (e.g. the degree
+# sign) that AppleGothic itself lacks — NanumGothic on the real fixture host
+# has an empty Celsius glyph, confirmed by a real document.
+_GLYPH_FALLBACK_PATHS = (
+    FALLBACK_FONT_PATHS["regular"][0],  # AppleGothic
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    FALLBACK_FONT_PATHS["regular"][1],  # DejaVu Sans (Linux)
+)
 
 
 class SlideReconstruction(BaseModel):
@@ -331,11 +342,8 @@ class PptxSlideRenderer:
         if key not in self._glyph_fonts:
             chosen = font
             if not char.isspace() and font.getmask(char).getbbox() is None:
-                # NanumGothic on the real fixture host has an empty Celsius
-                # glyph. Fall back per glyph, not for the whole paragraph.
-                for path in ('/System/Library/Fonts/Supplemental/AppleGothic.ttf',
-                             '/System/Library/Fonts/Apple Symbols.ttf',
-                             '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
+                # Fall back per glyph, not for the whole paragraph.
+                for path in _GLYPH_FALLBACK_PATHS:
                     try:
                         candidate = ImageFont.truetype(path, size)
                     except OSError:

@@ -94,24 +94,33 @@ _FALLBACK_MDW_PX = 7.0
 MAX_CANVAS_PIXELS = 40_000_000  # skip capturing abnormally large ranges (memory protection)
 MAX_CELL_TEXT_CHARS = 300  # prevent slow rendering from a pathologically long cell value
 
-_FONT_REGULAR_CANDIDATES = [
-    str(Path.home() / "Library/Fonts/NanumGothic-Regular.ttf"),
-    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-    # Linux fallback — these are hardcoded (not resolved via `fc-list`, unlike
-    # _find_font_file_for_family) because this is the last-resort glyph
-    # renderer, not the MDW-measurement path; DejaVu ships in the common
-    # `fonts-dejavu-core` package and covers Latin text passably. Without
-    # this, a Linux install with neither NanumGothic nor DejaVu falls all
-    # the way through to PIL's tiny fixed-size `ImageFont.load_default()`,
-    # which silently produces badly-sized captures (confirmed: CI's text
-    # size measurement diverges enough that fit-shrinking never triggers).
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-]
-_FONT_BOLD_CANDIDATES = [
-    str(Path.home() / "Library/Fonts/NanumGothic-Bold.ttf"),
-    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",  # substitute the regular file if no bold file exists (faked bold below)
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-]
+# Family names tried first, via `_find_font_file_for_family` (fc-list) —
+# this is what makes the fallback portable to *any* machine that has
+# NanumGothic installed through its normal OS font-install mechanism,
+# instead of one specific developer's install path. Only reached before
+# `_FONT_PATH_FALLBACKS` below, and only when fc-list itself is installed.
+_FALLBACK_FONT_FAMILIES = ("NanumGothic",)
+
+# Last-resort fixed paths, tried only when none of `_FALLBACK_FONT_FAMILIES`
+# resolved (fontconfig unavailable, or the family isn't installed). Both are
+# OS/package-guaranteed locations rather than a specific machine's install:
+# AppleGothic ships with every macOS install, and DejaVu Sans ships in the
+# common `fonts-dejavu-core` Linux package (installed explicitly in CI —
+# see "Install fonts used by capture rendering" in tests.yml). Without a
+# working entry here, a machine with neither NanumGothic nor DejaVu falls
+# all the way through to PIL's tiny fixed-size `ImageFont.load_default()`,
+# which silently produces badly-sized captures (confirmed: CI's text size
+# measurement diverges enough that fit-shrinking never triggers).
+FALLBACK_FONT_PATHS: dict[str, list[str]] = {
+    "regular": [
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ],
+    "bold": [
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",  # substitute the regular file if no bold file exists (faked bold below)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ],
+}
 
 _DEFAULT_TEXT_RGB = (30, 30, 30)
 _GRID_RGB = (220, 220, 220)  # default light-gray gridline used where there's no actual border formatting
@@ -147,14 +156,23 @@ def _load_capture_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     key = ("bold" if bold else "regular", size)
     if key in _font_cache:
         return _font_cache[key]
-    candidates = _FONT_BOLD_CANDIDATES if bold else _FONT_REGULAR_CANDIDATES
     font = None
-    for candidate in candidates:
+    for family in _FALLBACK_FONT_FAMILIES:
+        path = _find_font_file_for_family(family)
+        if path is None:
+            continue
         try:
-            font = ImageFont.truetype(candidate, size)
+            font = ImageFont.truetype(str(path), size)
             break
         except OSError:
             continue
+    if font is None:
+        for candidate in FALLBACK_FONT_PATHS["bold" if bold else "regular"]:
+            try:
+                font = ImageFont.truetype(candidate, size)
+                break
+            except OSError:
+                continue
     if font is None:
         font = ImageFont.load_default()
     _font_cache[key] = font
@@ -228,8 +246,8 @@ def _measure_mdw_px(font_name: str, size_pt: float) -> float | None:
     `font_name`/`size_pt` font. Returns None if no font by that exact name
     is available locally (the caller falls back to `_FALLBACK_MDW_PX`) —
     measuring instead with the Korean substitute font this module uses for
-    label-text rendering (`_FONT_REGULAR_CANDIDATES`, NanumGothic/
-    AppleGothic) was also tried (confirmed on a screw fastening-strength
+    label-text rendering (`_FALLBACK_FONT_FAMILIES`/`FALLBACK_FONT_PATHS`,
+    NanumGothic/AppleGothic) was also tried (confirmed on a screw fastening-strength
     review document, substituting Dotum -> NanumGothic), but the substitute
     font's actual MDW came out even further from the Calibri approximation
     than the original font's would be (overshoot 22% -> 53%), so it was

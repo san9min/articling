@@ -43,9 +43,10 @@ from pathlib import Path
 
 import pymupdf
 
-from ..scaffold import save_image_bytes
+from .._geometry import cluster_indices, iou
+from ..scaffold import CAPTION_PREFIXES, resolve_capture_dir, save_image_bytes
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from .pdf import _CAPTION_PREFIXES, _normalized_bbox, _resort_pdf_content_nodes
+from .pdf import _normalized_bbox, _resort_pdf_content_nodes
 
 _MIN_ITEMS_FOR_FIGURE = 100  # confirmed (module docstring): 0-53 for decorative lines/table borders vs. 624+ for a real vector figure
 _MIN_FIGURE_SIZE = 30.0  # minimum candidate bbox width/height (pt) — same idea as pdf_tables.py's _MIN_TABLE_SIZE
@@ -74,17 +75,6 @@ def _expand(bbox: tuple[float, float, float, float], pad: float) -> tuple[float,
     return (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
 
 
-def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
-    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
-    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
-    if ix1 <= ix0 or iy1 <= iy0:
-        return 0.0
-    inter = (ix1 - ix0) * (iy1 - iy0)
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / (area_a + area_b - inter)
-
-
 def _bbox_center_inside(bbox: tuple[float, float, float, float], region: tuple[float, float, float, float], tol: float = 0.0) -> bool:
     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
     return (region[0] - tol <= cx <= region[2] + tol) and (region[1] - tol <= cy <= region[3] + tol)
@@ -104,31 +94,13 @@ def detect_vector_figure_regions(page: pymupdf.Page) -> list[FigureCandidate]:
     if n == 0:
         return []
 
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int) -> None:
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[rx] = ry
-
     expanded = [_expand(r, _CLUSTER_GAP_TOL) for r in rects]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if _bbox_overlaps(expanded[i], rects[j]):
-                union(i, j)
 
-    clusters: dict[int, list[int]] = {}
-    for i in range(n):
-        clusters.setdefault(find(i), []).append(i)
+    def connected(i: int, j: int) -> bool:
+        return _bbox_overlaps(expanded[i], rects[j])
 
     candidates: list[FigureCandidate] = []
-    for members in clusters.values():
+    for members in cluster_indices(n, connected):
         if len(members) < _MIN_ITEMS_FOR_FIGURE:
             continue
         x0 = min(rects[i][0] for i in members)
@@ -171,7 +143,7 @@ def enrich_pdf_figures(document: ArticDocument, capture_dir: Path | None = None)
     Returns: the list of newly created Image node ids."""
     artifact = next(n for n in document.nodes if n.type == NodeType.ARTIFACT)
     pdf_path = Path(document.source_path)
-    capture_root = capture_dir if capture_dir is not None else pdf_path.parent / "captures"
+    capture_root = resolve_capture_dir(pdf_path, capture_dir)
     created: list[str] = []
 
     pdf = pymupdf.open(str(pdf_path))
@@ -196,7 +168,7 @@ def enrich_pdf_figures(document: ArticDocument, capture_dir: Path | None = None)
                 cand_bbox_norm = _normalized_bbox(cand.bbox, w, h)
                 cand_norm = (cand_bbox_norm["x_min"], cand_bbox_norm["y_min"], cand_bbox_norm["x_max"], cand_bbox_norm["y_max"])
 
-                if any(_iou(cand_norm, existing) > _DEDUP_IOU for existing in existing_image_bboxes):
+                if any(iou(cand_norm, existing) > _DEDUP_IOU for existing in existing_image_bboxes):
                     continue  # an area already captured as a raster image — avoid creating a duplicate
 
                 absorbed = [
@@ -212,7 +184,7 @@ def enrich_pdf_figures(document: ArticDocument, capture_dir: Path | None = None)
                     # CAPTION_OF to (confirmed: found a case where Figure
                     # 4's caption bbox overlapped the vector content on the
                     # y-axis and nearly got absorbed).
-                    and not (n.type == NodeType.TEXT and n.properties.get("text", "").startswith(_CAPTION_PREFIXES))
+                    and not (n.type == NodeType.TEXT and n.properties.get("text", "").startswith(CAPTION_PREFIXES))
                 ]
 
                 pixmap = page.get_pixmap(clip=pymupdf.Rect(*cand.bbox), dpi=200)

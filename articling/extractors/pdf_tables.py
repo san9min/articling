@@ -34,10 +34,14 @@ from dataclasses import dataclass
 
 import pymupdf
 
+from .._geometry import cluster_indices, iou
+
 _LINE_TOL = 1.0  # within this much tolerance, treated as "exactly horizontal/vertical" (pt)
 _XSPAN_TOL = 3.0  # ruled-rows mode: x0/x1 tolerance for counting lines as on the same row (pt)
 _MIN_TABLE_SIZE = 15.0  # minimum candidate bbox width/height (pt) — filters out noise like underlines
 _PAD = 2.0  # margin added to a candidate bbox (pt)
+_MERGE_IOU = 0.3  # boxed-mode and ruled-rows-mode candidates over this IoU are treated as the same table
+_CROSS_TOL = 2.0  # boxed mode: segments within this tolerance (pt) are treated as meeting/overlapping
 
 
 @dataclass
@@ -129,7 +133,7 @@ def _detect_grid(segments: list[tuple[str, float, float, float, float]]) -> list
             return (a0, b, a1, b)
         return (b, a0, b, a1)
 
-    tol = 2.0
+    tol = _CROSS_TOL
 
     def connected(i: int, j: int) -> bool:
         """Only treats two segments as the same grid when they actually meet
@@ -153,32 +157,10 @@ def _detect_grid(segments: list[tuple[str, float, float, float, float]]) -> list
         v_a0, v_a1, v_b = (ai0, ai1, bi) if ki == "v" else (aj0, aj1, bj)
         return (h_a0 - tol <= v_b <= h_a1 + tol) and (v_a0 - tol <= h_b <= v_a1 + tol)
 
-    n = len(segments)
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int) -> None:
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[rx] = ry
-
     boxes = [seg_bbox(s) for s in segments]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if connected(i, j):
-                union(i, j)
-
-    clusters: dict[int, list[int]] = {}
-    for i in range(n):
-        clusters.setdefault(find(i), []).append(i)
 
     candidates: list[TableCandidate] = []
-    for members in clusters.values():
+    for members in cluster_indices(len(segments), connected):
         h_ys = {round(segments[i][3], 1) for i in members if segments[i][0] == "h"}
         v_xs = {round(segments[i][3], 1) for i in members if segments[i][0] == "v"}
         if not h_ys or not v_xs:
@@ -196,17 +178,6 @@ def _detect_grid(segments: list[tuple[str, float, float, float, float]]) -> list
     return candidates
 
 
-def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
-    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
-    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
-    if ix1 <= ix0 or iy1 <= iy0:
-        return 0.0
-    inter = (ix1 - ix0) * (iy1 - iy0)
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / (area_a + area_b - inter)
-
-
 def detect_table_candidates(page: pymupdf.Page) -> list[TableCandidate]:
     """Finds every table candidate bbox on one page (boxed + ruled-rows
     merged, overlapping candidates combined into one). Provides only the
@@ -218,7 +189,7 @@ def detect_table_candidates(page: pymupdf.Page) -> list[TableCandidate]:
     # merge candidates that overlap by IoU (the same table can be caught by both modes at once) — keep the larger one
     merged: list[TableCandidate] = []
     for cand in sorted(candidates, key=lambda c: -(c.bbox[2] - c.bbox[0]) * (c.bbox[3] - c.bbox[1])):
-        if any(_iou(cand.bbox, m.bbox) > 0.3 for m in merged):
+        if any(iou(cand.bbox, m.bbox) > _MERGE_IOU for m in merged):
             continue
         merged.append(cand)
 

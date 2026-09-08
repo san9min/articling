@@ -10,6 +10,25 @@ from pathlib import Path
 
 from .schema import Edge, EdgeType, Node, NodeType
 
+CAPTURE_SUBDIR = "captures"
+
+# A "표 "/"그림 "/"Table "/"Figure "/... prefix immediately before a
+# Table/Image is a cross-format signal, not a per-extractor one — docx.py,
+# pdf.py and pptx.py all treat the same prefix set as a caption marker.
+CAPTION_PREFIXES = ("표 ", "그림 ", "Table ", "Figure ", "<표", "<그림", "[표", "[그림")
+
+
+def resolve_capture_dir(source_path: Path, capture_dir: Path | None) -> Path:
+    """Resolve the directory an extractor should write visual captures into.
+
+    Every extractor accepts an optional `capture_dir` override and otherwise
+    defaults to a `captures/` sibling of the source file — centralized here
+    so the default name can't drift between formats (see docx.py/pptx.py/
+    pdf.py/xlsx.py, all of which pass their own `path`/`capture_dir` through
+    this same rule).
+    """
+    return capture_dir if capture_dir is not None else source_path.parent / CAPTURE_SUBDIR
+
 
 def file_node(path: Path) -> Node:
     return Node(
@@ -46,6 +65,38 @@ def parent_edges(parent: Node, children: list[Node]) -> list[Edge]:
     isn't a slide (a sheet or a whole document).
     """
     return [Edge(type=EdgeType.PARENT_OF, source_id=parent.id, target_id=n.id) for n in children]
+
+
+def caption_prefix_edges(content_nodes: list[Node]) -> list[Edge]:
+    """CAPTION_OF heuristic proposal (safe to add straight to `doc.edges` —
+    see the articling-conventions skill's "two trust tiers" note; this is
+    the deterministic tier, not an LLM proposal).
+
+    A Text node whose text starts with a caption-style prefix (see
+    `CAPTION_PREFIXES`) gets a CAPTION_OF edge to whichever of its immediate
+    neighbors in `content_nodes` (by reading order, one before/one after) is
+    a Table or Image. Shared by docx.py/pdf.py/pptx.py, since all three
+    define "immediately before/after" the same way (adjacency within one
+    Artifact's content list); an extractor may end up attaching the same
+    heuristic edge to both a preceding and a following candidate on purpose,
+    leaving disambiguation to review or to
+    `relations.propose.resolve_ambiguous_captions`.
+    """
+    edges: list[Edge] = []
+    for i, n in enumerate(content_nodes):
+        if n.type != NodeType.TEXT:
+            continue
+        text = n.properties.get("text", "")
+        if not text.startswith(CAPTION_PREFIXES):
+            continue
+        neighbors = (
+            content_nodes[i - 1] if i > 0 else None,
+            content_nodes[i + 1] if i + 1 < len(content_nodes) else None,
+        )
+        for neighbor in neighbors:
+            if neighbor is not None and neighbor.type in (NodeType.TABLE, NodeType.IMAGE):
+                edges.append(Edge(type=EdgeType.CAPTION_OF, source_id=n.id, target_id=neighbor.id))
+    return edges
 
 
 def check_invariants(nodes: list[Node], edges: list[Edge]) -> list[str]:

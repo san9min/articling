@@ -172,12 +172,13 @@ import pymupdf
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
+from .._geometry import cluster_indices
 from .._image_util import encode_image_data_url, encode_png_bytes_data_url
 from ..capture.xlsx_capture import capture_table_image
 from ..extractors.pdf import _y_overlap_frac
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
+from ._config import DEFAULT_MODEL
 
-DEFAULT_MODEL = "gpt-5.6-terra"  # 2026-09-04: unified from gpt-4.1-mini (same model as caption_images.py)
 CONTEXT_WINDOW = 3  # how many content nodes before/after the anchor to offer as candidates
 
 # Batching/concurrency defaults shared by `promote_heading_parents`/`merge_fragmented_text`.
@@ -1333,36 +1334,18 @@ def _find_same_line_text_clusters(document: ArticDocument) -> list[list[Node]]:
         b = n.properties["bbox"]
         return (b["x_min"], b["y_min"], b["x_max"], b["y_max"])
 
+    def _height(box: tuple[float, float, float, float]) -> float:
+        return box[3] - box[1]
+
     clusters: list[list[Node]] = []
     for nodes in by_page.values():
-        n = len(nodes)
-        parent = list(range(n))
+        def connected(i: int, j: int) -> bool:
+            bi, bj = bbox_tuple(nodes[i]), bbox_tuple(nodes[j])
+            if _height(bi) > _FRAGMENT_LINE_MAX_HEIGHT or _height(bj) > _FRAGMENT_LINE_MAX_HEIGHT:
+                return False
+            return _y_overlap_frac(bi, bj) >= _FRAGMENT_LINE_Y_OVERLAP
 
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(x: int, y: int) -> None:
-            rx, ry = find(x), find(y)
-            if rx != ry:
-                parent[rx] = ry
-
-        for i in range(n):
-            if bbox_tuple(nodes[i])[3] - bbox_tuple(nodes[i])[1] > _FRAGMENT_LINE_MAX_HEIGHT:
-                continue
-            for j in range(i + 1, n):
-                if bbox_tuple(nodes[j])[3] - bbox_tuple(nodes[j])[1] > _FRAGMENT_LINE_MAX_HEIGHT:
-                    continue
-                if _y_overlap_frac(bbox_tuple(nodes[i]), bbox_tuple(nodes[j])) >= _FRAGMENT_LINE_Y_OVERLAP:
-                    union(i, j)
-
-        groups: dict[int, list[int]] = {}
-        for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-
-        for members in groups.values():
+        for members in cluster_indices(len(nodes), connected):
             if len(members) < 2:
                 continue
             ordered = sorted(members, key=lambda i: bbox_tuple(nodes[i])[0])
@@ -1612,38 +1595,18 @@ def _find_semantic_text_regions(
 
     regions: list[list[Node]] = []
     for page_nodes in by_page.values():
-        parent = list(range(len(page_nodes)))
+        def connected(i: int, j: int) -> bool:
+            lx0, ly0, lx1, ly1 = box(page_nodes[i])
+            rx0, ry0, rx1, ry1 = box(page_nodes[j])
+            if ly1 - ly0 > _SEMANTIC_MAX_NODE_HEIGHT or ry1 - ry0 > _SEMANTIC_MAX_NODE_HEIGHT:
+                return False
+            x_gap = gap(lx0, lx1, rx0, rx1)
+            y_gap = gap(ly0, ly1, ry0, ry1)
+            same_row = y_gap == 0 and x_gap <= horizontal_gap
+            same_column = x_gap == 0 and y_gap <= vertical_gap
+            return same_row or same_column
 
-        def find(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
-
-        def union(left: int, right: int) -> None:
-            left_root, right_root = find(left), find(right)
-            if left_root != right_root:
-                parent[left_root] = right_root
-
-        for i, left in enumerate(page_nodes):
-            lx0, ly0, lx1, ly1 = box(left)
-            if ly1 - ly0 > _SEMANTIC_MAX_NODE_HEIGHT:
-                continue
-            for j in range(i + 1, len(page_nodes)):
-                rx0, ry0, rx1, ry1 = box(page_nodes[j])
-                if ry1 - ry0 > _SEMANTIC_MAX_NODE_HEIGHT:
-                    continue
-                x_gap = gap(lx0, lx1, rx0, rx1)
-                y_gap = gap(ly0, ly1, ry0, ry1)
-                same_row = y_gap == 0 and x_gap <= horizontal_gap
-                same_column = x_gap == 0 and y_gap <= vertical_gap
-                if same_row or same_column:
-                    union(i, j)
-
-        groups: dict[int, list[int]] = {}
-        for i in range(len(page_nodes)):
-            groups.setdefault(find(i), []).append(i)
-        for members in groups.values():
+        for members in cluster_indices(len(page_nodes), connected):
             if len(members) < 2:
                 continue
             ordered = sorted(members, key=lambda i: (box(page_nodes[i])[1], box(page_nodes[i])[0]))
@@ -2094,10 +2057,17 @@ def propose_synthetic_groups(
 
 
 def apply_vlm_enrichment(
-    document: ArticDocument, client=None, *, include_text_anchors: bool = True,
+    document: ArticDocument, client=None, model: str = DEFAULT_MODEL, *, include_text_anchors: bool = True,
     slide_images: dict[int, str | Path] | None = None,
 ) -> list[str]:
-    """Optional `slide_images` maps every zero-based PPTX slide index to an
+    """`model` overrides every step's own default (`HEADING_MODEL`/
+    `MERGE_MODEL`/`SEMANTIC_MERGE_MODEL`/`GROUP_MODEL`, all normally
+    `DEFAULT_MODEL`) in one place — this bundle is exactly the "use the VLM
+    or not" on/off switch the CLI's `--vlm-enrichment` flag maps to, so a
+    caller that wants a non-default model shouldn't have to call the five
+    underlying functions by hand just to pass `model=` to each.
+
+    Optional `slide_images` maps every zero-based PPTX slide index to an
     external PNG/JPEG. These supply full-slide visual evidence to heading,
     relation, and synthetic-group decisions; grouping runs last for PPTX
     documents with attached slide images. No external converter is invoked.
@@ -2156,16 +2126,16 @@ def apply_vlm_enrichment(
 
         client = OpenAI()
 
-    merge_semantic_text_groups(document, client=client)
-    merge_fragmented_text(document, client=client)
-    promoted = promote_heading_parents(document, client=client, include_text_anchors=include_text_anchors)
+    merge_semantic_text_groups(document, client=client, model=model)
+    merge_fragmented_text(document, client=client, model=model)
+    promoted = promote_heading_parents(document, client=client, model=model, include_text_anchors=include_text_anchors)
     nest_numbered_headings(document)
-    document.edges.extend(propose_edges(document, client=client))
+    document.edges.extend(propose_edges(document, client=client, model=model))
     if document.format == "pptx" and any(
         n.type == NodeType.ARTIFACT and n.properties.get("slide_image_path")
         for n in document.nodes
     ):
-        propose_synthetic_groups(document, client=client)
+        propose_synthetic_groups(document, client=client, model=model)
     return promoted
 
 

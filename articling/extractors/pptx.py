@@ -50,10 +50,8 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
 
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from ..scaffold import file_node, parent_edges, save_image_bytes
+from ..scaffold import caption_prefix_edges, file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
-_CAPTION_PREFIXES = ("표 ", "그림 ", "Table ", "Figure ", "<표", "<그림", "[표", "[그림")
-CAPTURE_SUBDIR = "captures"
 # An embedded/linked OLE object (e.g. an Excel worksheet dropped onto a
 # slide) has no python-pptx picture API at all — without this, `_classify_shape`
 # falls through every branch and the shape (and its position) disappears from
@@ -595,7 +593,7 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
     """`capture_dir`: the directory to save picture shape originals into
     (default: `captures/` next to `path`) — the same convention as
     `docx.extract`."""
-    capture_root = capture_dir if capture_dir is not None else path.parent / CAPTURE_SUBDIR
+    capture_root = resolve_capture_dir(path, capture_dir)
     prs = Presentation(str(path))
     file_n = file_node(path)
     nodes: list[Node] = [file_n]
@@ -667,16 +665,7 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
             seen_references.add(key)
             edges.append(edge)
 
-        for i, n in enumerate(content):
-            if n.type != NodeType.TEXT:
-                continue
-            text = n.properties.get("text", "")
-            if not text.startswith(_CAPTION_PREFIXES):
-                continue
-            neighbors = (content[i - 1] if i > 0 else None, content[i + 1] if i + 1 < len(content) else None)
-            for neighbor in neighbors:
-                if neighbor is not None and neighbor.type in (NodeType.TABLE, NodeType.IMAGE):
-                    edges.append(Edge(type=EdgeType.CAPTION_OF, source_id=n.id, target_id=neighbor.id))
+        edges.extend(caption_prefix_edges(content))
 
     # NEXT between slides (between Artifacts) — the File -> Artifact PARENT_OF edge was already added above
     for a, b in zip(artifacts, artifacts[1:]):

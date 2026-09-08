@@ -35,14 +35,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--check", action="store_true", help="check scaffold invariants (PARENT_OF/NEXT integrity) and report to stderr")
     parser.add_argument("--slide-images", type=Path, help="JSON object mapping zero-based PPTX slide indices to PNG/JPEG paths (relative to the JSON file); requires --vlm-enrichment")
+    parser.add_argument("--model", help="override the VLM model used by --vlm-enrichment (default: relations._config.DEFAULT_MODEL)")
     args = parser.parse_args(argv)
     if args.slide_images and not args.vlm_enrichment:
         parser.error("--slide-images requires --vlm-enrichment")
+    if args.model and not args.vlm_enrichment:
+        parser.error("--model requires --vlm-enrichment")
 
     document = extract(args.path)
 
     if args.vlm_enrichment:
-        from .relations.propose import apply_vlm_enrichment
+        from .relations.propose import DEFAULT_MODEL, apply_vlm_enrichment
 
         slide_images = None
         if args.slide_images:
@@ -53,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
                 slide_images = {int(k): args.slide_images.parent / v for k, v in mapping.items()}
             except (OSError, ValueError) as exc:
                 parser.error(f"Invalid --slide-images manifest: {exc}")
-        apply_vlm_enrichment(document, slide_images=slide_images)
+        apply_vlm_enrichment(document, model=args.model or DEFAULT_MODEL, slide_images=slide_images)
 
     if args.check:
         problems = check_invariants(document.nodes, document.edges)
