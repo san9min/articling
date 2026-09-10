@@ -7,6 +7,7 @@ dist/
 .env
 tests/fixtures/captures/
 examples/out/
+examples/*/captures/
 demo/.sessions/
 demo/__pycache__/
 *.cypher
