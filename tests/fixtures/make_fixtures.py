@@ -315,6 +315,31 @@ def build_xlsx(path: Path) -> Path:
     return path
 
 
+def build_xlsx_with_native_table(path: Path) -> Path:
+    """A formal Excel Table (Insert > Table / ws.add_table) — the "blue-striped"
+    kind with a name and a filter-row, as opposed to `build_xlsx`'s
+    border-detected table. Real spreadsheets (e.g. Power BI/Excel tutorial
+    workbooks) commonly use this feature; `_table_ranges` reads it via
+    `ws.tables`, a distinct code path from border detection."""
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+
+    rows = [("항목", "값"), ("토크", "3.4 kgf"), ("길이", "12 mm")]
+    for r, (a, b) in enumerate(rows, start=1):
+        ws.cell(row=r, column=1, value=a)
+        ws.cell(row=r, column=2, value=b)
+
+    table = Table(displayName="SpecTable", ref="A1:B3")
+    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+    ws.add_table(table)
+
+    wb.save(str(path))
+    return path
+
+
 def build_xlsx_with_overlapping_standalone_images(path: Path) -> Path:
     """Two standalone images overlapping each other, outside any table
     range — reproduces a real case (a driver-icon photo placed separately

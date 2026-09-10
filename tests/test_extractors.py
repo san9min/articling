@@ -20,6 +20,7 @@ from fixtures.make_fixtures import (  # noqa: E402
     build_pptx_with_shaded_table,
     build_pptx_with_smartart,
     build_xlsx,
+    build_xlsx_with_native_table,
     build_xlsx_with_overlapping_standalone_images,
 )
 from lxml import etree  # noqa: E402
@@ -234,6 +235,22 @@ def test_xlsx_extract(tmp_path: Path) -> None:
 
     image_path = Path(images[0].properties["image_path"])
     assert image_path.exists(), "the standalone image outside the table range must actually have its original saved"
+
+
+def test_xlsx_native_table_extract(tmp_path: Path) -> None:
+    """Regression test — `ws.tables.items()` (a `TableList`) yields
+    `(name, ref_string)` pairs, not `(name, Table)` like a plain dict would;
+    `_table_ranges` used to call `.ref` on that string and crash on any real
+    workbook using a formal Excel Table (e.g. Microsoft's own Financial
+    Sample.xlsx demo workbook)."""
+    path = build_xlsx_with_native_table(tmp_path / "sample.xlsx")
+    doc = xlsx_extractor.extract(path, capture_dir=tmp_path / "captures")
+
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    assert len(tables) == 1
+    assert tables[0].name.startswith("SpecTable")
+    assert tables[0].properties["range"] == "R1C1:R3C2"
+    assert check_invariants(doc.nodes, doc.edges) == []
 
 
 def _inject_into_drawing_xml(src_path: Path, dst_path: Path, extra_anchor_xml: str) -> None:

@@ -76,9 +76,12 @@ from ..scaffold import file_node, parent_edges, resolve_capture_dir, save_image_
 
 
 def _table_ranges(ws) -> dict[tuple[int, int, int, int], str]:
+    # ws.tables is a TableList (dict subclass): TableList.items() deliberately
+    # yields (name, ref_string) pairs, not (name, Table) — unlike plain
+    # dict.items(). Use the ref string directly rather than `.ref` on it.
     ranges = {}
-    for name, tbl in ws.tables.items():
-        min_col, min_row, max_col, max_row = range_boundaries(tbl.ref)
+    for name, ref in ws.tables.items():
+        min_col, min_row, max_col, max_row = range_boundaries(ref)
         ranges[(min_row, min_col, max_row, max_col)] = name
     return ranges
 
