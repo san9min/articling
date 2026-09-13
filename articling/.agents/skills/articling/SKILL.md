@@ -147,3 +147,22 @@ Rules of thumb:
   paragraphs as several small `Text` nodes to read in sequence.
 - LLM-proposed `CAPTION_OF`/`REFERENCES` edges require a human review pass;
   don't treat `--vlm-enrichment` output as final.
+
+### Native placement and semantic hierarchy
+
+All four extractors use `articling.structure.finalize_structure` for native
+placement preservation and deterministic caption/reference matching within each
+Artifact. Content nodes retain `properties.native_location` with `artifact_id`
+and, when known, zero-based `page_index`. This is source placement evidence;
+`PARENT_OF` represents the interpreted hierarchy and can change independently.
+The nested property is included in JSON and serialized by the existing Neo4j
+property exporter. Older graphs without it still resolve scope through parents.
+
+DOCX outline levels and matched PDF bookmarks feed the same hierarchy engine.
+Its ancestor stack spans the entire document, including page breaks. Slides and
+sheets remain separate scopes. Word headings own subsequent body blocks until
+an equal or higher heading; PDF bookmarks establish only matched heading
+relationships. Unmatched bookmarks block inheritance through missing ancestors.
+DOCX page numbers are omitted when native extraction cannot establish them;
+page geometry remains separate from logical parentage. Optional visual/LLM
+rendering still uses format-specific adapters.

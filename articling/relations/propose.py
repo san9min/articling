@@ -829,23 +829,9 @@ def build_context_windows(
 
 
 def _content_artifact_map(document: ArticDocument) -> dict[str, str]:
-    artifact_ids = {node.id for node in document.nodes if node.type == NodeType.ARTIFACT}
-    parent_by_child = {
-        edge.target_id: edge.source_id for edge in document.edges if edge.type == EdgeType.PARENT_OF
-    }
-    mapping: dict[str, str] = {}
-    for node in document.content_nodes():
-        current = node.id
-        seen = {current}
-        while current in parent_by_child:
-            current = parent_by_child[current]
-            if current in artifact_ids:
-                mapping[node.id] = current
-                break
-            if current in seen:
-                break
-            seen.add(current)
-    return mapping
+    from ..structure import content_artifact_map
+
+    return content_artifact_map(document)
 
 
 def _spatial_distance(document: ArticDocument, left: Node, right: Node) -> tuple[float, float]:

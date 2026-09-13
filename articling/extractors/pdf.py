@@ -76,7 +76,8 @@ from pydantic import BaseModel, Field
 
 from .._geometry import cluster_indices
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from ..scaffold import caption_prefix_edges, file_node, parent_edges, reference_label_edges, resolve_capture_dir, save_image_bytes
+from ..structure import StructureEvent, hierarchy_edges, finalize_structure
+from ..scaffold import file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
 _LINE_Y_OVERLAP = 0.5  # y must overlap at least this much to count as "the same line" and get its x order fixed
 _LINE_MAX_HEIGHT = 30.0  # only considered a reorder candidate when both are at or under this height (pt) (explained below)
@@ -321,20 +322,11 @@ def _outline_structure(pdf, artifact: Node, content: list[Node]) -> list[Edge]:
         used.add(candidate.id)
         candidate.properties.update(outline_level=level - 1, outline_title=str(title), outline_page=page_number)
     artifact.properties["outline_matched_count"] = len(used)
-    edges = {edge.target_id: edge for edge in parent_edges(artifact, content)}
-    stack: list[tuple[int, Node | None]] = []
-    for level, node in matched:
-        while stack and stack[-1][0] >= level:
-            stack.pop()
-        parent = stack[-1][1] if stack else artifact
-        if node is not None and parent is not None and parent.id != node.id:
-            edge = parent_edges(parent, [node])[0]
-            edge.properties["structural_source"] = "pdf_outline"
-            edges[node.id] = edge
-        stack.append((level, node))
-    # An outline proves relationships between matched headings, not ownership
-    # of every intervening block (unlisted sections, footnotes, references).
-    return list(edges.values())
+    return hierarchy_edges(
+        artifact, content,
+        [StructureEvent(node=node, level=level - 1) for level, node in matched],
+        source="pdf_outline",
+    )
 
 
 def extract(
@@ -464,11 +456,9 @@ def extract(
     nodes.extend(content_nodes)
     edges.extend(outline_edges)
 
-    caption_edges = caption_prefix_edges(content_nodes)
-    edges.extend(caption_edges)
-    edges.extend(reference_label_edges(content_nodes, caption_edges))
-
     document = ArticDocument(source_path=str(path.resolve()), format="pdf", nodes=nodes, edges=edges)
+
+    finalize_structure(document)
 
     if enrich_tables:
         from ..relations.table_structure import enrich_pdf_tables  # lazy import — avoids a circular import and keeps openai/torch unneeded when this option isn't used

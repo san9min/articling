@@ -36,7 +36,8 @@ from docx.table import Table
 from docx.oxml.xmlchemy import BaseOxmlElement
 
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from ..scaffold import caption_prefix_edges, file_node, parent_edges, reference_label_edges, resolve_capture_dir, save_image_bytes
+from ..structure import StructureEvent, hierarchy_edges, finalize_structure
+from ..scaffold import file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
 
 def _paragraph_has_image(p: Paragraph) -> bool:
@@ -154,24 +155,16 @@ def _native_structure(artifact: Node, content: list[Node]) -> list[Edge]:
     TOC entries are navigation, not body headings or section content.
     Explicit internal links are references only when their bookmark is unique.
     """
-    stack: list[Node] = []
-    edges: list[Edge] = []
+    edges = hierarchy_edges(
+        artifact, content,
+        [StructureEvent(node=node, level=node.properties.get("outline_level"),
+                        excluded=node.properties.get("is_toc", False)) for node in content],
+        source="docx_outline", owns_body=True,
+    )
     bookmarks: dict[str, list[str]] = {}
     for node in content:
         for name in node.properties.get("bookmarks", []):
             bookmarks.setdefault(name, []).append(node.id)
-        level = node.properties.get("outline_level")
-        toc = node.properties.get("is_toc", False)
-        if level is not None and not toc:
-            while stack and stack[-1].properties["outline_level"] >= level:
-                stack.pop()
-        parent = stack[-1] if stack and not toc else artifact
-        edge = parent_edges(parent, [node])[0]
-        if not toc and (stack or level is not None):
-            edge.properties["structural_source"] = "docx_outline"
-        edges.append(edge)
-        if level is not None and not toc:
-            stack.append(node)
     for node in content:
         for target in node.properties.get("internal_links", []):
             matches = bookmarks.get(target, [])
@@ -307,8 +300,4 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
     nodes.extend(content_nodes)
     edges.extend(_native_structure(artifact, content_nodes))
 
-    caption_edges = caption_prefix_edges(content_nodes)
-    edges.extend(caption_edges)
-    edges.extend(reference_label_edges(content_nodes, caption_edges))
-
-    return ArticDocument(source_path=str(path.resolve()), format="docx", nodes=nodes, edges=edges)
+    return finalize_structure(ArticDocument(source_path=str(path.resolve()), format="docx", nodes=nodes, edges=edges))
