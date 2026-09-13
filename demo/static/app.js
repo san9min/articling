@@ -18,8 +18,8 @@ const TYPE_COLOR = {
 };
 
 // Fallback only — actual node depth is computed per graph from PARENT_OF edges
-// (see computeLevels), because `promote_heading_parents`/`propose_synthetic_groups`
-// can reparent/insert a node one level deeper than the normal Artifact ->
+// (see computeLevels), because `propose_edges`'s HEADING_PARENT role/
+// `propose_synthetic_groups` can reparent/insert a node one level deeper than the normal Artifact ->
 // content depth. A static per-type table can't reflect that. Group defaults
 // to the same level as its usual members (Text) since it's inserted between
 // their old parent and them.
@@ -603,7 +603,7 @@ function showDetail(nodeId) {
   }
 
   // this node's incoming PARENT_OF — worth calling out when it's a heading Text
-  // rather than the usual Artifact (i.e. promote_heading_parents reparented it)
+  // rather than the usual Artifact (i.e. propose_edges's HEADING_PARENT role reparented it)
   const parentEdge = (state.currentEdges || []).find((e) => e.type === "PARENT_OF" && e.target_id === n.id);
   if (parentEdge) {
     const parentNode = state.nodesById.get(parentEdge.source_id);

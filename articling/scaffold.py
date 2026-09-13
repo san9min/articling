@@ -6,6 +6,7 @@ computation that cannot fail.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .schema import Edge, EdgeType, Node, NodeType
@@ -16,6 +17,21 @@ CAPTURE_SUBDIR = "captures"
 # Table/Image is a cross-format signal, not a per-extractor one — docx.py,
 # pdf.py and pptx.py all treat the same prefix set as a caption marker.
 CAPTION_PREFIXES = ("표 ", "그림 ", "Table ", "Figure ", "<표", "<그림", "[표", "[그림")
+
+# Same label vocabulary as CAPTION_PREFIXES, but as a "label + number"
+# pattern searched anywhere in a text, not just a leading prefix — this is
+# what lets `reference_label_edges` recognize a citation like "Figure 1" or
+# "표1" wherever it's mentioned, not only at the start of a caption. `\s*`
+# (not `\s+`) also matches the no-space Korean form ("표1").
+_REFERENCE_LABEL_RE = re.compile(r"(표|그림|Table|Figure)\.?\s*(\d+)", re.IGNORECASE)
+
+
+def _reference_label_key(word: str, number: str) -> tuple[str, str]:
+    """Normalizes "표"/"Table" and "그림"/"Figure" (either language, either
+    case) to the same key, so a Korean caption ("표 1") and an English
+    in-body citation ("Table 1") of the same numbered item still match."""
+    canonical = "table" if word.lower() in ("표", "table") else "figure"
+    return (canonical, number)
 
 
 def resolve_capture_dir(source_path: Path, capture_dir: Path | None) -> Path:
@@ -75,11 +91,12 @@ def caption_prefix_edges(content_nodes: list[Node]) -> list[Edge]:
     A Text node whose text starts with a caption-style prefix (see
     `CAPTION_PREFIXES`) gets a CAPTION_OF edge to whichever of its immediate
     neighbors in `content_nodes` (by reading order, one before/one after) is
-    a Table or Image. Shared by docx.py/pdf.py/pptx.py, since all three
-    define "immediately before/after" the same way (adjacency within one
-    Artifact's content list); an extractor may end up attaching the same
-    heuristic edge to both a preceding and a following candidate on purpose,
-    leaving disambiguation to review or to
+    a Table or Image. Shared by docx.py/pdf.py/pptx.py/xlsx.py, since all
+    four define "immediately before/after" the same way (adjacency within
+    one Artifact's content list — for xlsx.py, one sheet's content sorted by
+    row/col); an extractor may end up attaching the same heuristic edge to
+    both a preceding and a following candidate on purpose, leaving
+    disambiguation to review or to
     `relations.propose.resolve_ambiguous_captions`.
     """
     edges: list[Edge] = []
@@ -96,6 +113,59 @@ def caption_prefix_edges(content_nodes: list[Node]) -> list[Edge]:
         for neighbor in neighbors:
             if neighbor is not None and neighbor.type in (NodeType.TABLE, NodeType.IMAGE):
                 edges.append(Edge(type=EdgeType.CAPTION_OF, source_id=n.id, target_id=neighbor.id))
+    return edges
+
+
+def reference_label_edges(content_nodes: list[Node], caption_edges: list[Edge]) -> list[Edge]:
+    """REFERENCES heuristic (same trust tier as `caption_prefix_edges` —
+    safe to add straight to `doc.edges`, not an LLM proposal): when some
+    other Text explicitly cites a caption's own label ("Figure 1", "표1"),
+    that citing Text gets a REFERENCES edge to the same anchor the caption
+    already resolved to. The same mechanism a paper's inline "[1]" has to
+    its bibliography entry — just keyed by caption label+number instead of
+    a citation index.
+
+    `caption_edges`: the CAPTION_OF edges already resolved for this same
+    `content_nodes` (normally `caption_prefix_edges`'s own output) — the
+    source of truth for "which label points at which anchor." A bare
+    "Figure 1" mention with no matching caption anywhere in `content_nodes`
+    creates no edge; this only connects citations to labels that are
+    already grounded, it never invents a label -> anchor mapping of its
+    own. Citing text elsewhere in the graph that doesn't share a
+    `content_nodes` call with its caption (e.g. a different pptx slide)
+    isn't matched — same locality assumption `caption_prefix_edges` makes.
+    """
+    nodes_by_id = {n.id: n for n in content_nodes}
+    label_to_anchor: dict[tuple[str, str], str] = {}
+    caption_source_ids: set[str] = set()
+    for e in caption_edges:
+        if e.type != EdgeType.CAPTION_OF:
+            continue
+        caption_node = nodes_by_id.get(e.source_id)
+        if caption_node is None:
+            continue
+        match = _REFERENCE_LABEL_RE.search(caption_node.properties.get("text", ""))
+        if match is None:
+            continue
+        label_to_anchor[_reference_label_key(*match.groups())] = e.target_id
+        caption_source_ids.add(e.source_id)
+
+    if not label_to_anchor:
+        return []
+
+    edges: list[Edge] = []
+    seen: set[tuple[str, str]] = set()
+    for n in content_nodes:
+        # A caption's own text isn't treated as a citation of its own (or
+        # any other) label — it's already linked via CAPTION_OF.
+        if n.type != NodeType.TEXT or n.id in caption_source_ids:
+            continue
+        for word, number in _REFERENCE_LABEL_RE.findall(n.properties.get("text", "")):
+            anchor_id = label_to_anchor.get(_reference_label_key(word, number))
+            if anchor_id is None or (n.id, anchor_id) in seen:
+                continue
+            seen.add((n.id, anchor_id))
+            edges.append(Edge(type=EdgeType.REFERENCES, source_id=n.id, target_id=anchor_id))
     return edges
 
 
@@ -118,6 +188,27 @@ def check_invariants(nodes: list[Node], edges: list[Edge]) -> list[str]:
     for target_id, count in incoming.items():
         if count > 1:
             problems.append(f"{target_id} has PARENT_OF fan-in={count} (expected <=1)")
+
+    # Check every edge even when fan-in is already invalid. An iterative
+    # DFS avoids recursion limits on deeply nested documents.
+    children: dict[str, list[str]] = {}
+    for e in parent_of:
+        children.setdefault(e.source_id, []).append(e.target_id)
+    finished: set[str] = set()
+    active: set[str] = set()
+    for start in node_ids:
+        stack = [(start, False)]
+        while stack:
+            current, leaving = stack.pop()
+            if leaving:
+                active.discard(current)
+                finished.add(current)
+            elif current in active:
+                problems.append(f"PARENT_OF cycle found at {current}")
+            elif current not in finished:
+                active.add(current)
+                stack.append((current, True))
+                stack.extend((child, False) for child in children.get(current, []))
 
     next_edges = [e for e in edges if e.type == EdgeType.NEXT]
     out_deg: dict[str, int] = {}

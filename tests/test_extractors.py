@@ -1,11 +1,42 @@
 from __future__ import annotations
 
+import io
 import sys
 import types
 import zipfile
 from pathlib import Path
 
+import openpyxl
+import pymupdf
+
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+def test_pdf_outline_matches_headings_not_mentions_or_diagram_labels(tmp_path: Path) -> None:
+    from articling.relations.propose import _apply_heading_reparents, _build_document_context_windows
+
+    path = tmp_path / "outline.pdf"
+    with pymupdf.open() as source:
+        page = source.new_page()
+        for y, text in [(50, "This text mentions Attention."), (100, "Attention"),
+                        (200, "1 Architecture"), (300, "1.1 Attention"),
+                        (400, "References"), (440, "Unlisted material")]:
+            page.insert_text((72, y), text)
+        source.set_toc([[1, "Architecture", 1], [2, "Attention", 1, 300]])
+        source.save(path)
+    doc = pdf_extractor.extract(path, capture_dir=tmp_path / "captures")
+    texts = {n.properties["text"]: n for n in doc.nodes if n.type == NodeType.TEXT}
+    artifact = next(n for n in doc.nodes if n.type == NodeType.ARTIFACT)
+    parents = {e.target_id: e.source_id for e in doc.edges if e.type == EdgeType.PARENT_OF}
+    assert parents[texts["1.1 Attention"].id] == texts["1 Architecture"].id
+    assert "outline_level" not in texts["Attention"].properties
+    assert "outline_level" not in texts["This text mentions Attention."].properties
+    assert parents[texts["References"].id] == artifact.id
+    assert parents[texts["Unlisted material"].id] == artifact.id
+    assert _apply_heading_reparents(doc, "test", [(texts["1.1 Attention"], texts["Attention"], "wrong")]) == []
+    windows = _build_document_context_windows(doc, window=3, anchor_types=(NodeType.TEXT,), boundary_types=())
+    assert texts["1.1 Attention"].id not in {n.id for n, _ in windows}
+    assert check_invariants(doc.nodes, doc.edges) == []
 
 from fixtures.make_fixtures import (  # noqa: E402
     build_docx,
@@ -13,6 +44,7 @@ from fixtures.make_fixtures import (  # noqa: E402
     build_pdf,
     build_pdf_out_of_stream_order,
     build_pdf_with_figure_caption,
+    build_pdf_with_figure_reference,
     build_pptx,
     build_pptx_with_box_over_image,
     build_pptx_with_chart,
@@ -22,6 +54,7 @@ from fixtures.make_fixtures import (  # noqa: E402
     build_xlsx,
     build_xlsx_with_native_table,
     build_xlsx_with_overlapping_standalone_images,
+    build_xlsx_with_table_caption_and_reference,
 )
 from lxml import etree  # noqa: E402
 from PIL import Image as PILImage  # noqa: E402
@@ -105,6 +138,57 @@ def test_docx_absorbs_table_cell_image_as_metadata(tmp_path: Path) -> None:
     [entry] = table.properties["embedded_images"]
     assert entry["table_row"] == 0 and entry["table_col"] == 0
     assert Path(entry["image_path"]).exists(), "the cell image's original bytes must still be saved"
+
+
+def test_docx_uses_native_heading_outline_for_parent_edges(tmp_path: Path) -> None:
+    """Word heading levels provide a deterministic hierarchy, so body text
+    and nested headings should not depend on a small VLM context window."""
+    from docx import Document
+
+    path = tmp_path / "outline.docx"
+    source = Document()
+    source.add_heading("Section", level=1)
+    source.add_paragraph("Section body")
+    source.add_heading("Subsection", level=2)
+    source.add_paragraph("Subsection body")
+    source.save(path)
+
+    doc = docx_extractor.extract(path, capture_dir=tmp_path / "captures")
+    by_text = {
+        n.properties.get("text"): n for n in doc.nodes if n.type == NodeType.TEXT
+    }
+    parents = {
+        e.target_id: e.source_id
+        for e in doc.edges
+        if e.type == EdgeType.PARENT_OF
+    }
+    assert by_text["Section"].properties["outline_level"] == 0
+    assert by_text["Subsection"].properties["outline_level"] == 1
+    assert parents[by_text["Section body"].id] == by_text["Section"].id
+    assert parents[by_text["Subsection"].id] == by_text["Section"].id
+    assert parents[by_text["Subsection body"].id] == by_text["Subsection"].id
+    assert check_invariants(doc.nodes, doc.edges) == []
+
+
+def test_docx_preserves_automatic_list_identity(tmp_path: Path) -> None:
+    """Automatic numbering lives in w:numPr, not paragraph text."""
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    path = tmp_path / "numbered.docx"
+    source = Document()
+    paragraphs = [source.add_paragraph(text) for text in ("first", "second", "third")]
+    for paragraph in paragraphs:
+        ppr = paragraph._p.get_or_add_pPr()
+        num_pr = OxmlElement("w:numPr")
+        ilvl = OxmlElement("w:ilvl"); ilvl.set(qn("w:val"), "0")
+        num_id = OxmlElement("w:numId"); num_id.set(qn("w:val"), "7")
+        num_pr.extend((ilvl, num_id)); ppr.append(num_pr)
+    source.save(path)
+    doc = docx_extractor.extract(path, capture_dir=tmp_path / "captures")
+    texts = [n for n in doc.nodes if n.type == NodeType.TEXT]
+    assert [(n.properties["list_num_id"], n.properties["list_level"]) for n in texts] == [(7, 0)] * 3
 
 
 def test_pptx_extract(tmp_path: Path) -> None:
@@ -292,6 +376,116 @@ def _inject_xdr_rect_shape(
     _inject_into_drawing_xml(src_path, dst_path, shape_xml)
 
 
+def _inject_xdr_pic_twocell(
+    src_path: Path,
+    dst_path: Path,
+    from_rc: tuple[int, int],
+    to_rc: tuple[int, int],
+    image_bytes: bytes,
+) -> None:
+    """Injects a `xdr:twoCellAnchor`/`xdr:pic` (genuinely resized to fit
+    `from_rc`..`to_rc`, default `editAs="twoCell"`) — with its own media
+    part and relationship, the same mechanics as `_inject_xdr_pic`
+    (elsewhere in this file) but a two-cell anchor instead of a one-cell
+    one, so the picture's real extent can reach arbitrarily far past a
+    table's own declared border (exercising
+    `_embedded_image_overflow_bounds`)."""
+    with zipfile.ZipFile(src_path) as zin:
+        entries = {name: zin.read(name) for name in zin.namelist()}
+
+    media_name = "xl/media/image_overflow_test.png"
+    entries[media_name] = image_bytes
+
+    rels_name = "xl/drawings/_rels/drawing1.xml.rels"
+    rels_xml = entries[rels_name].decode("utf-8")
+    r_id = "rIdOverflowTest"
+    new_rel = (
+        '<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        f'Target="../media/image_overflow_test.png" Id="{r_id}"/>'
+    )
+    entries[rels_name] = rels_xml.replace("</Relationships>", new_rel + "</Relationships>").encode("utf-8")
+
+    pic_xml = (
+        '<xdr:twoCellAnchor xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<xdr:from><xdr:col>{from_rc[1]}</xdr:col><xdr:colOff>0</xdr:colOff>"
+        f"<xdr:row>{from_rc[0]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        f"<xdr:to><xdr:col>{to_rc[1]}</xdr:col><xdr:colOff>0</xdr:colOff>"
+        f"<xdr:row>{to_rc[0]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        "<xdr:pic>"
+        '<xdr:nvPicPr><xdr:cNvPr id="901" name="OverflowTestPic"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+        f'<xdr:blipFill><a:blip r:embed="{r_id}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+        '<xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+        "</xdr:pic>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+    drawing_name = next(n for n in entries if n.startswith("xl/drawings/drawing") and n.endswith(".xml"))
+    entries[drawing_name] = entries[drawing_name].replace(b"</wsDr>", pic_xml.encode("utf-8") + b"</wsDr>")
+
+    with zipfile.ZipFile(dst_path, "w") as zout:
+        for name, data in entries.items():
+            zout.writestr(name, data)
+
+
+def test_xlsx_capture_table_extends_canvas_for_overflowing_twocell_image(tmp_path: Path) -> None:
+    """Regression test — an embedded `TwoCellAnchor` image anchored inside a
+    table but genuinely reaching several columns past the table's own
+    border used to get clipped at the canvas edge: `capture_table_image`'s
+    canvas was only ever widened by a fixed `padding` (1 cell), not by
+    however far the image's own `to` corner actually reached. Injects a
+    wide asymmetric (left-red/right-blue) image anchored from inside the
+    table (C2, inside `build_xlsx`'s B2:C3) out to column G — 4 columns
+    past the table's own border — and confirms blue (the image's far/right
+    side) survives in the capture, proving the canvas widened enough not to
+    clip it (see `_embedded_image_overflow_bounds`)."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    overflowed = tmp_path / "sample_with_overflowing_image.xlsx"
+    _inject_xdr_pic_twocell(base, overflowed, from_rc=(1, 2), to_rc=(2, 6), image_bytes=_asymmetric_png_bytes())
+
+    doc = xlsx_extractor.extract(overflowed, capture_dir=tmp_path / "captures")
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    assert len(tables) == 1
+    capture_path = Path(tables[0].properties["capture_path"])
+    img = PILImage.open(capture_path).convert("RGB")
+    assert _has_pixel(img, lambda px: px[2] > 150 and px[0] < 100), (
+        "the wide image's blue right half must survive uncropped in the table capture"
+    )
+
+
+def test_xlsx_capture_table_extends_canvas_for_overflowing_fixed_size_image(tmp_path: Path) -> None:
+    """Regression test — a fixed-size (`editAs="oneCell"`) embedded image
+    (confirmed as the anchor type real annotation photos in these documents
+    actually use — see the screwdriver-photo flip bug found on the same
+    kind of file) has no `to` corner at all; its real width comes only from
+    its own EMU `ext`. `build_xlsx`'s sheet has `ws.max_column == 3` (no
+    cell value reaches further right), so *without* walking a fixed-size
+    anchor's `ext` forward column by column (`_advance_col_by_width`), the
+    canvas would be capped at column 3 by `sheet_max_col` regardless of
+    `padding` — genuinely clipping (not just squishing) a wide photo via
+    PIL's `paste`, unlike the `TwoCellAnchor` case in
+    `test_xlsx_capture_table_extends_canvas_for_overflowing_twocell_image`
+    (which instead resizes to whatever `to`-based width it computes). Injects
+    a wide asymmetric (left-red/right-blue) `oneCell` image anchored at C2
+    (inside `build_xlsx`'s B2:C3) with an `ext` several columns wide, and
+    confirms blue survives uncropped."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    overflowed = tmp_path / "sample_with_overflowing_fixed_image.xlsx"
+    _inject_xdr_pic(
+        base, overflowed, from_rc=(1, 2), ext_emu=(3_000_000, 200_000), image_bytes=_asymmetric_png_bytes()
+    )
+
+    doc = xlsx_extractor.extract(overflowed, capture_dir=tmp_path / "captures")
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    assert len(tables) == 1
+    capture_path = Path(tables[0].properties["capture_path"])
+    img = PILImage.open(capture_path).convert("RGB")
+    assert _has_pixel(img, lambda px: px[2] > 150 and px[0] < 100), (
+        "the wide fixed-size image's blue right half must survive uncropped in the table capture"
+    )
+
+
 def test_xlsx_capture_includes_manually_drawn_shape(tmp_path: Path) -> None:
     """Regression test — openpyxl never parses `xdr:sp` (a shape: e.g. a
     highlight rectangle a person drew directly on top of a photo) at all
@@ -405,6 +599,132 @@ def test_xlsx_capture_draws_straight_connector_with_arrowhead(tmp_path: Path) ->
     )
 
 
+def _inject_xdr_connector(
+    src_path: Path, dst_path: Path, from_rc: tuple[int, int], to_rc: tuple[int, int], prst: str, hex_color: str
+) -> None:
+    """`from_rc`/`to_rc` are 0-based (row, col). A `xdr:cxnSp` with the given
+    `prstGeom` preset (e.g. `"bentConnector3"`/`"curvedConnector3"`) and no
+    arrowheads."""
+    conn_xml = (
+        '<xdr:twoCellAnchor xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        f"<xdr:from><xdr:col>{from_rc[1]}</xdr:col><xdr:colOff>0</xdr:colOff>"
+        f"<xdr:row>{from_rc[0]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        f"<xdr:to><xdr:col>{to_rc[1]}</xdr:col><xdr:colOff>0</xdr:colOff>"
+        f"<xdr:row>{to_rc[0]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        '<xdr:cxnSp macro="">'
+        '<xdr:nvCxnSpPr><xdr:cNvPr id="3" name="Conn"/><xdr:cNvCxnSpPr/></xdr:nvCxnSpPr>'
+        "<xdr:spPr>"
+        f'<a:prstGeom prst="{prst}"><a:avLst/></a:prstGeom>'
+        f'<a:ln w="25400"><a:solidFill><a:srgbClr val="{hex_color}"/></a:solidFill></a:ln>'
+        "</xdr:spPr>"
+        "</xdr:cxnSp>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+    _inject_into_drawing_xml(src_path, dst_path, conn_xml)
+
+
+def test_xlsx_capture_draws_bent_connector(tmp_path: Path) -> None:
+    """Regression test — `bentConnector*` used to be skipped outright (see
+    `_bent_connector_points`); verifies it's now drawn as a midpoint elbow,
+    i.e. the connector's color shows up away from the diagonal between its
+    two bbox corners (proof it actually bent, not just a straight line the
+    old skip-check happened to let through)."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    shaped = tmp_path / "sample_with_bent_connector.xlsx"
+    _inject_xdr_connector(base, shaped, from_rc=(1, 1), to_rc=(5, 5), prst="bentConnector3", hex_color="00FFFF")
+
+    doc = xlsx_extractor.extract(shaped, capture_dir=tmp_path / "captures")
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    capture_path = Path(tables[0].properties["capture_path"])
+    img = PILImage.open(capture_path).convert("RGB")
+
+    is_cyan = lambda px: px[1] > 180 and px[2] > 180 and px[0] < 100  # noqa: E731
+    assert _has_pixel(img, is_cyan), "the bent connector's cyan line must be drawn in the capture PNG"
+
+    pixels = img.load()
+    width, height = img.size
+    cyan_pixels = [(x, y) for y in range(height) for x in range(width) if is_cyan(pixels[x, y])]
+    top_edge_y = min(y for _x, y in cyan_pixels)
+    xs_at_top = [x for x, y in cyan_pixels if y == top_edge_y]
+    # A plain diagonal line only grazes any single y row across a span of
+    # about one line-width (~3px here); the elbow's horizontal segment spans
+    # a much wider run of x at its (near-)constant y — proof a real bend was
+    # drawn, not a straight diagonal the old skip-check happened to let
+    # through unrecognized.
+    assert max(xs_at_top) - min(xs_at_top) > 15, (
+        "the near-horizontal segment of a bent connector's elbow must span many pixels of x at one y, "
+        "not just the width of a plain diagonal line"
+    )
+
+
+def test_xlsx_capture_draws_curved_connector(tmp_path: Path) -> None:
+    """Regression test — `curvedConnector*` used to be skipped outright (see
+    `_curved_connector_points`); verifies it's now drawn as a flattened
+    Bezier S-curve."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    shaped = tmp_path / "sample_with_curved_connector.xlsx"
+    _inject_xdr_connector(base, shaped, from_rc=(1, 1), to_rc=(5, 5), prst="curvedConnector3", hex_color="00FFFF")
+
+    doc = xlsx_extractor.extract(shaped, capture_dir=tmp_path / "captures")
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    capture_path = Path(tables[0].properties["capture_path"])
+    img = PILImage.open(capture_path).convert("RGB")
+
+    assert _has_pixel(img, lambda px: px[1] > 180 and px[2] > 180 and px[0] < 100), (
+        "the curved connector's cyan curve must be drawn in the capture PNG"
+    )
+
+
+def test_xlsx_capture_draws_polygon_preset_shape(tmp_path: Path) -> None:
+    """Regression test — a non-rect/ellipse `prstGeom` (e.g. `"diamond"`)
+    used to always render as a plain rectangle (see
+    `_PRESET_UNIT_POLYGONS`); verifies a filled diamond leaves its own bbox
+    corners as background (unlike a rectangle, which would fill them)."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    shaped = tmp_path / "sample_with_diamond.xlsx"
+    shape_xml = (
+        '<xdr:twoCellAnchor xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        "<xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        '<xdr:sp macro="" textlink="">'
+        '<xdr:nvSpPr><xdr:cNvPr id="20" name="Diamond"/><xdr:cNvSpPr/></xdr:nvSpPr>'
+        "<xdr:spPr>"
+        '<a:prstGeom prst="diamond"><a:avLst/></a:prstGeom>'
+        '<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>'
+        "</xdr:spPr>"
+        "</xdr:sp>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+    _inject_into_drawing_xml(base, shaped, shape_xml)
+
+    doc = xlsx_extractor.extract(shaped, capture_dir=tmp_path / "captures")
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    capture_path = Path(tables[0].properties["capture_path"])
+    img = PILImage.open(capture_path).convert("RGB")
+
+    is_green = lambda px: px[1] > 150 and px[0] < 100 and px[2] < 100  # noqa: E731
+    assert _has_pixel(img, is_green), "the diamond's green fill must be drawn in the capture PNG"
+
+    pixels = img.load()
+    width, height = img.size
+    green_pixels = [(x, y) for y in range(height) for x in range(width) if is_green(pixels[x, y])]
+    green_xs = [x for x, _y in green_pixels]
+    green_ys = [y for _x, y in green_pixels]
+    x1, y1, x2, y2 = min(green_xs), min(green_ys), max(green_xs), max(green_ys)
+    bbox_area = (x2 - x1 + 1) * (y2 - y1 + 1)
+    # A diamond covers exactly half its bounding box's area (in continuous
+    # geometry); a rectangle fallback would cover the whole thing. Using a
+    # generous 80% threshold (rather than exactly 50%) absorbs rasterization
+    # rounding at small pixel sizes while still clearly separating the two.
+    assert len(green_pixels) < bbox_area * 0.8, (
+        "a diamond must cover meaningfully less than its full bounding box — a rectangle fallback would fill all of it"
+    )
+
+
 def test_xlsx_capture_expands_grouped_shapes(tmp_path: Path) -> None:
     """Regression test — an `xdr:grpSp` that a person "grouped" by selecting
     several shapes used to have its inner shapes not drawn at all, because
@@ -470,6 +790,58 @@ def test_xlsx_capture_expands_grouped_shapes(tmp_path: Path) -> None:
     )
 
 
+def test_xlsx_capture_rotates_grouped_shapes(tmp_path: Path) -> None:
+    """Regression test — a rotated `xdr:grpSp` (`grpSpPr/xfrm`'s `rot`) used
+    to be skipped entirely (see `_expand_group_shapes`'s old early return).
+    Injects a group rotated 45 degrees around a single child shape that
+    fills the group's whole internal coordinate system (so its center
+    coincides with the group's own center, isolating "does the child's own
+    rotation pick up the group's rotation" from "was the child's position
+    also correctly rotated," which `test_xlsx_capture_expands_grouped_shapes`
+    already covers for the unrotated case) — verifies the shape is actually
+    drawn rotated, the same corner-stays-background check as
+    `test_xlsx_capture_rotates_shapes`."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    shaped = tmp_path / "sample_with_rotated_group.xlsx"
+    group_xml = (
+        '<xdr:twoCellAnchor xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        "<xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        '<xdr:grpSp>'
+        '<xdr:nvGrpSpPr><xdr:cNvPr id="30" name="RotGroup"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>'
+        '<xdr:grpSpPr>'
+        '<a:xfrm rot="2700000"><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+        '<a:chOff x="0" y="0"/><a:chExt cx="2000000" cy="2000000"/></a:xfrm>'
+        "</xdr:grpSpPr>"
+        '<xdr:sp macro="" textlink="">'
+        '<xdr:nvSpPr><xdr:cNvPr id="31" name="Full"/><xdr:cNvSpPr/></xdr:nvSpPr>'
+        "<xdr:spPr>"
+        '<a:xfrm><a:off x="0" y="0"/><a:ext cx="2000000" cy="2000000"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        '<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>'
+        "</xdr:spPr>"
+        "</xdr:sp>"
+        "</xdr:grpSp>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+    _inject_into_drawing_xml(base, shaped, group_xml)
+
+    doc = xlsx_extractor.extract(shaped, capture_dir=tmp_path / "captures")
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    capture_path = Path(tables[0].properties["capture_path"])
+    img = PILImage.open(capture_path).convert("RGB")
+
+    assert _has_pixel(img, lambda px: px[1] > 150 and px[0] < 120 and px[2] < 120), (
+        "the rotated group's green shape must still be drawn"
+    )
+    top_left = img.getpixel((0, 0))
+    assert top_left == (255, 255, 255), (
+        "an unrotated square would fill the padded canvas's very corner; a 45-degree rotation must leave it background"
+    )
+
+
 def _inject_xdr_text_shape(
     src_path: Path, dst_path: Path, from_rc: tuple[int, int], to_rc: tuple[int, int], text: str, hex_color: str
 ) -> None:
@@ -516,6 +888,275 @@ def test_xlsx_capture_draws_shape_label_text(tmp_path: Path) -> None:
     assert _has_pixel(img, lambda px: px[0] > 200 and px[1] > 200 and px[2] < 100), (
         "the yellow text of a fill/outline-less text-box shape must be drawn in the capture PNG"
     )
+
+
+def _inject_pic_xfrm(src_path: Path, dst_path: Path, off_emu: tuple[int, int], ext_emu: tuple[int, int]) -> None:
+    """Rewrites the *second* `<pic>` in the drawing XML (`build_xlsx`'s
+    standalone "Image 2" at F10 — the in-table "Image 1" is first) to carry
+    an explicit `pic/spPr/xfrm` off+ext, and also resizes that anchor's own
+    top-level `<ext>` (sibling of `<from>`) to the same `ext_emu` — that
+    sibling `<ext>`, not `pic/spPr/xfrm/ext`, is what `image_anchor_rect`
+    actually uses for a fixed-size (`oneCell`) anchor's rendered pixel size,
+    so leaving it at `build_xlsx`'s tiny original (381000x285750 EMU) would
+    make the photo itself render far smaller than `ext_emu` implies.
+    openpyxl itself never writes `pic/spPr/xfrm` at all (confirmed:
+    `build_xlsx`'s own drawing XML has none), so a test exercising
+    `_pic_anchor_own_off_ext_emu`'s calibration path has to inject it
+    directly — the same reason `_inject_xdr_rect_shape` exists for shapes."""
+    with zipfile.ZipFile(src_path) as zin:
+        entries = {name: zin.read(name) for name in zin.namelist()}
+    drawing_name = next(n for n in entries if n.startswith("xl/drawings/drawing") and n.endswith(".xml"))
+    xml = entries[drawing_name].decode("utf-8")
+    marker = "<spPr><a:prstGeom"
+    first = xml.index(marker)
+    second = xml.index(marker, first + 1)
+
+    # The anchor-level <ext .../> is the closest one preceding this <pic>'s
+    # own <spPr> — resize it in place.
+    anchor_ext_start = xml.rindex("<ext ", 0, second)
+    anchor_ext_end = xml.index("/>", anchor_ext_start) + len("/>")
+    new_anchor_ext = f'<ext cx="{ext_emu[0]}" cy="{ext_emu[1]}"/>'
+    xml = xml[:anchor_ext_start] + new_anchor_ext + xml[anchor_ext_end:]
+    # `second` shifted by however much that replacement changed the length.
+    second += len(new_anchor_ext) - (anchor_ext_end - anchor_ext_start)
+
+    xfrm = (
+        '<a:xfrm xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        f'<a:off x="{off_emu[0]}" y="{off_emu[1]}"/><a:ext cx="{ext_emu[0]}" cy="{ext_emu[1]}"/></a:xfrm>'
+    )
+    insert_at = second + len("<spPr>")
+    xml = xml[:insert_at] + xfrm + xml[insert_at:]
+    entries[drawing_name] = xml.encode("utf-8")
+    with zipfile.ZipFile(dst_path, "w") as zout:
+        for name, data in entries.items():
+            zout.writestr(name, data)
+
+
+def test_xlsx_standalone_image_annotation_refines_position_via_own_offset(tmp_path: Path) -> None:
+    """Regression test — `_xml_anchor_rect` positions a shape from
+    `col_off[fc] + emu_to_px(fco)`, summing this module's *approximate*
+    per-column pixel width from the canvas origin out to that shape's own
+    column; the more columns in between (or the wider those columns are
+    declared), the more that can drift from Excel's real column widths
+    (confirmed on a real document: a red highlight box annotating two
+    screws, anchored 3 columns past its photo, rendered a whole photo-width
+    off, onto blank background instead of the screws). Widens column G
+    (between the photo, anchored at F10 per `build_xlsx`, and a shape
+    anchored just past it in column H) enough that the naive column-based
+    estimate would place the shape past the photo's own midpoint, then
+    gives both their own explicit `spPr/xfrm` off/ext (the shape's 15% into
+    the photo's own footprint — near its *left* edge) and confirms the
+    shape lands there instead — proof `annotate_standalone_image` refines a
+    shape's position via the EMU delta between the two anchors' own offsets
+    (`_calibrate_rect_from_offsets`) rather than trusting the column-based
+    estimate outright. The shape still has to pass the ordinary column-based
+    overlap check first (unchanged by this refinement — see
+    `test_xlsx_standalone_image_annotation_rejects_a_distant_shapes_coincidental_offset`
+    for why that gate has to run *before* calibration, not after)."""
+    base = tmp_path / "sample_wide_cols.xlsx"
+    wb = openpyxl.load_workbook(build_xlsx(tmp_path / "sample.xlsx"))
+    ws = wb["Sheet1"]
+    ws.column_dimensions["G"].width = 30  # wider than its real (unknown) rendered width, to induce naive drift
+    wb.save(str(base))
+
+    with_pic_xfrm = tmp_path / "sample_with_pic_xfrm.xlsx"
+    image_off = (5_000_000, 3_000_000)
+    image_ext = (4_000_000, 2_000_000)
+    _inject_pic_xfrm(base, with_pic_xfrm, image_off, image_ext)
+
+    shaped = tmp_path / "sample_with_nearby_shape.xlsx"
+    shape_off = (image_off[0] + round(image_ext[0] * 0.15), image_off[1] + round(image_ext[1] * 0.15))
+    shape_ext = (round(image_ext[0] * 0.2), round(image_ext[1] * 0.2))
+    nearby_shape_xml = (
+        '<xdr:twoCellAnchor xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        "<xdr:from><xdr:col>7</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>9</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        '<xdr:sp macro="" textlink="">'
+        '<xdr:nvSpPr><xdr:cNvPr id="500" name="NearbyBox"/><xdr:cNvSpPr/></xdr:nvSpPr>'
+        "<xdr:spPr>"
+        f'<a:xfrm><a:off x="{shape_off[0]}" y="{shape_off[1]}"/><a:ext cx="{shape_ext[0]}" cy="{shape_ext[1]}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        '<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>'
+        "</xdr:spPr>"
+        "</xdr:sp>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+    _inject_into_drawing_xml(with_pic_xfrm, shaped, nearby_shape_xml)
+
+    doc = xlsx_extractor.extract(shaped, capture_dir=tmp_path / "captures")
+    images = [n for n in doc.nodes if n.type == NodeType.IMAGE]
+    assert len(images) == 1
+    assert images[0].properties.get("annotation_shape_count") == 1
+
+    image_path = Path(images[0].properties["image_path"])
+    img = PILImage.open(image_path).convert("RGB")
+    width = img.width
+    is_green = lambda px: px[1] > 150 and px[0] < 100 and px[2] < 100  # noqa: E731
+    green_xs = [x for y in range(img.height) for x in range(width) if is_green(img.getpixel((x, y)))]
+    assert green_xs, "the shape must be drawn"
+    # Calibrated (via off/ext), it sits 15% into the photo's width — near
+    # the left edge. The naive column-based estimate (column G widened to
+    # 30 chars) would instead push it out past the photo's own midpoint.
+    assert max(green_xs) < width * 0.4, (
+        "the shape must land near the photo's left edge (per its own off), "
+        "not out past the midpoint the column-based estimate would compute"
+    )
+
+
+def test_xlsx_standalone_image_annotation_rejects_a_distant_shapes_coincidental_offset(tmp_path: Path) -> None:
+    """Regression test — a shape's own cached `spPr/xfrm off` isn't reliably
+    an absolute position spanning the *whole* sheet (confirmed on a real
+    document: a caption text box 18 rows and 35 columns away from an
+    unrelated photo had an `off` only ~150-260px from that photo's own
+    `off` — evidently stale/local, not live — which made it wrongly
+    "overlap" when a first version of this fix computed the overlap
+    decision *after* calibrating a shape's position instead of before).
+    Gives a shape anchored far away (row 30, column 40) an `off` deliberately
+    close to the photo's own `off`, and confirms it is *not* composited —
+    proof the ordinary column-based `rects_overlap` check still gates
+    calibration, so a coincidentally-close cached offset can't paper over an
+    actually-distant anchor."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    with_pic_xfrm = tmp_path / "sample_with_pic_xfrm.xlsx"
+    image_off = (5_000_000, 3_000_000)
+    image_ext = (381_000, 285_750)  # matches build_xlsx's own standalone image ext, see its drawing XML
+    _inject_pic_xfrm(base, with_pic_xfrm, image_off, image_ext)
+
+    shaped = tmp_path / "sample_with_distant_shape.xlsx"
+    # Physically far away (row 30, col 40) but an `off` only slightly past
+    # the photo's own — exactly the coincidence found on the real document.
+    distant_off = (image_off[0] + 50_000, image_off[1] + 50_000)
+    distant_ext = (round(image_ext[0] * 0.3), round(image_ext[1] * 0.3))
+    distant_shape_xml = (
+        '<xdr:twoCellAnchor xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        "<xdr:from><xdr:col>40</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>30</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>41</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>31</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        '<xdr:sp macro="" textlink="">'
+        '<xdr:nvSpPr><xdr:cNvPr id="501" name="DistantBox"/><xdr:cNvSpPr/></xdr:nvSpPr>'
+        "<xdr:spPr>"
+        f'<a:xfrm><a:off x="{distant_off[0]}" y="{distant_off[1]}"/><a:ext cx="{distant_ext[0]}" cy="{distant_ext[1]}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        '<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>'
+        "</xdr:spPr>"
+        "</xdr:sp>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+    _inject_into_drawing_xml(with_pic_xfrm, shaped, distant_shape_xml)
+
+    doc = xlsx_extractor.extract(shaped, capture_dir=tmp_path / "captures")
+    images = [n for n in doc.nodes if n.type == NodeType.IMAGE]
+    assert len(images) == 1
+    assert not images[0].properties.get("annotation_shape_count"), (
+        "a shape anchored 30 rows/35 columns away must not be composited onto this photo, "
+        "even though its cached off happens to sit close to the photo's own"
+    )
+
+
+def _asymmetric_png_bytes() -> bytes:
+    """A 40x20 PNG, red on the left half and blue on the right — asymmetric
+    so a horizontal mirror (`flipH`) is visible in a pixel test, unlike this
+    file's other fixture images (all a single solid color, which look
+    identical after mirroring)."""
+    img = PILImage.new("RGB", (40, 20), (220, 40, 40))
+    for x in range(20, 40):
+        for y in range(20):
+            img.putpixel((x, y), (40, 40, 220))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _inject_xdr_pic(
+    src_path: Path,
+    dst_path: Path,
+    from_rc: tuple[int, int],
+    ext_emu: tuple[int, int],
+    image_bytes: bytes,
+    flip_h: bool = False,
+) -> None:
+    """Injects a brand-new `xdr:oneCellAnchor`/`xdr:pic` — with its own
+    media part and relationship, not reusing an existing one — into the
+    drawing XML. `build_xlsx`'s own images are added through openpyxl's
+    `add_image`, which never writes `pic/spPr/xfrm` at all (confirmed
+    empirically: its saved drawing XML has no `xfrm` on either `<pic>`), so
+    a test exercising `pic_anchor_flip`/`_apply_flip` needs a hand-built
+    `<xdr:pic>`, the same reason `_inject_xdr_rect_shape` hand-builds an
+    `<xdr:sp>` for shapes."""
+    with zipfile.ZipFile(src_path) as zin:
+        entries = {name: zin.read(name) for name in zin.namelist()}
+
+    media_name = "xl/media/image_flip_test.png"
+    entries[media_name] = image_bytes
+
+    rels_name = "xl/drawings/_rels/drawing1.xml.rels"
+    rels_xml = entries[rels_name].decode("utf-8")
+    r_id = "rIdFlipTest"
+    new_rel = (
+        '<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        f'Target="../media/image_flip_test.png" Id="{r_id}"/>'
+    )
+    entries[rels_name] = rels_xml.replace("</Relationships>", new_rel + "</Relationships>").encode("utf-8")
+
+    flip_attr = ' flipH="1"' if flip_h else ""
+    pic_xml = (
+        '<xdr:oneCellAnchor xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<xdr:from><xdr:col>{from_rc[1]}</xdr:col><xdr:colOff>0</xdr:colOff>"
+        f"<xdr:row>{from_rc[0]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        f'<xdr:ext cx="{ext_emu[0]}" cy="{ext_emu[1]}"/>'
+        "<xdr:pic>"
+        '<xdr:nvPicPr><xdr:cNvPr id="900" name="FlipTestPic"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+        f'<xdr:blipFill><a:blip r:embed="{r_id}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+        f'<xdr:spPr><a:xfrm{flip_attr}><a:off x="0" y="0"/><a:ext cx="{ext_emu[0]}" cy="{ext_emu[1]}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+        "</xdr:pic>"
+        "<xdr:clientData/>"
+        "</xdr:oneCellAnchor>"
+    )
+    drawing_name = next(n for n in entries if n.startswith("xl/drawings/drawing") and n.endswith(".xml"))
+    entries[drawing_name] = entries[drawing_name].replace(b"</wsDr>", pic_xml.encode("utf-8") + b"</wsDr>")
+
+    with zipfile.ZipFile(dst_path, "w") as zout:
+        for name, data in entries.items():
+            zout.writestr(name, data)
+
+
+def _avg_rgb(img: PILImage.Image, x0: int, x1: int) -> tuple[float, float, float]:
+    pixels = [img.getpixel((x, y)) for x in range(x0, x1) for y in range(img.height)]
+    n = len(pixels)
+    return (sum(p[0] for p in pixels) / n, sum(p[1] for p in pixels) / n, sum(p[2] for p in pixels) / n)
+
+
+def test_xlsx_standalone_image_flip_is_applied(tmp_path: Path) -> None:
+    """Regression test — a standalone image's own `spPr/xfrm flipH="1"`
+    used to be silently ignored everywhere this module opens and pastes
+    image bytes (confirmed on a real document: a screwdriver photo placed
+    as an annotation, saved with `flipH="1"` meaning "show this mirrored,"
+    rendered pointing the wrong way in every capture because nothing
+    checked the flag). Injects an asymmetric (left-red/right-blue) image
+    with `flipH="1"`, far from any table or other image so it's captured
+    on its own (exercising `annotate_standalone_image`'s flip-only path,
+    where there's nothing else to composite), and confirms red/blue swap
+    sides in the saved capture."""
+    base = build_xlsx(tmp_path / "sample.xlsx")
+    flipped = tmp_path / "sample_with_flipped_image.xlsx"
+    _inject_xdr_pic(base, flipped, from_rc=(30, 30), ext_emu=(400_000, 200_000), image_bytes=_asymmetric_png_bytes(), flip_h=True)
+
+    doc = xlsx_extractor.extract(flipped, capture_dir=tmp_path / "captures")
+    images = [n for n in doc.nodes if n.type == NodeType.IMAGE and n.properties.get("row") == 31]
+    assert len(images) == 1, "the injected picture must show up as its own standalone Image node"
+
+    image_path = Path(images[0].properties["image_path"])
+    img = PILImage.open(image_path).convert("RGB")
+    left = _avg_rgb(img, 0, img.width // 2)
+    right = _avg_rgb(img, img.width // 2, img.width)
+    assert left[2] > left[0], "flipH='1' must move the blue half to the left side of the capture"
+    assert right[0] > right[2], "flipH='1' must move the red half to the right side of the capture"
 
 
 def test_xlsx_standalone_image_gets_annotation_shape_composited(tmp_path: Path) -> None:
@@ -597,6 +1238,28 @@ def test_xlsx_overlapping_standalone_images_get_absorbed(tmp_path: Path) -> None
     )
 
 
+def test_xlsx_extract_caption_and_reference_label_heuristics(tmp_path: Path) -> None:
+    """xlsx.py wires the same deterministic heuristics docx.py/pdf.py/pptx.py
+    use: "표 1. …" directly above a table gets a CAPTION_OF (`_CAPTION_PREFIXES`),
+    and a separate cell elsewhere on the sheet citing that same label by name
+    ("표1") gets a REFERENCES edge to the same table
+    (`scaffold.reference_label_edges`) — no proximity to the table required."""
+    path = build_xlsx_with_table_caption_and_reference(tmp_path / "table.xlsx")
+    doc = xlsx_extractor.extract(path, capture_dir=tmp_path / "captures")
+
+    tables = [n for n in doc.nodes if n.type == NodeType.TABLE]
+    caption = next(n for n in doc.nodes if n.type == NodeType.TEXT and n.properties["text"].startswith("표 1"))
+    citation = next(n for n in doc.nodes if n.type == NodeType.TEXT and n.properties["text"].startswith("표1"))
+    assert len(tables) == 1
+
+    caption_edges = [e for e in doc.edges if e.type == EdgeType.CAPTION_OF and e.source_id == caption.id and e.target_id == tables[0].id]
+    assert len(caption_edges) == 1, "the '표 1.' caption must resolve to a CAPTION_OF edge on the table"
+
+    reference_edges = [e for e in doc.edges if e.type == EdgeType.REFERENCES and e.source_id == citation.id and e.target_id == tables[0].id]
+    assert len(reference_edges) == 1, "citing the caption's own label ('표1') elsewhere on the sheet must resolve to a REFERENCES edge on the table"
+    assert check_invariants(doc.nodes, doc.edges) == []
+
+
 def test_pdf_extract_single_page(tmp_path: Path) -> None:
     path = build_pdf(tmp_path / "sample.pdf")
     doc = pdf_extractor.extract(path, capture_dir=tmp_path / "captures")
@@ -671,6 +1334,28 @@ def test_pdf_extract_caption_of_heuristic(tmp_path: Path) -> None:
         if e.type == EdgeType.CAPTION_OF and e.source_id == captions[0].id and e.target_id == images[0].id
     ]
     assert len(caption_edges) == 1, "the Figure caption must be proposed as CAPTION_OF on the immediately preceding image"
+    assert check_invariants(doc.nodes, doc.edges) == []
+
+
+def test_pdf_extract_reference_label_heuristic(tmp_path: Path) -> None:
+    """scaffold.py's deterministic `reference_label_edges` heuristic:
+    "As discussed in Figure 1, …" on a different page from the caption/image
+    still resolves to a REFERENCES edge on the image, purely by matching the
+    caption's own label — no proximity/adjacency involved, unlike
+    `caption_prefix_edges`."""
+    path = build_pdf_with_figure_reference(tmp_path / "referenced.pdf")
+    doc = pdf_extractor.extract(path, capture_dir=tmp_path / "captures")
+
+    images = [n for n in doc.nodes if n.type == NodeType.IMAGE]
+    citations = [n for n in doc.nodes if n.type == NodeType.TEXT and "discussed in Figure 1" in n.properties["text"]]
+    assert len(images) == 1
+    assert len(citations) == 1
+
+    reference_edges = [
+        e for e in doc.edges
+        if e.type == EdgeType.REFERENCES and e.source_id == citations[0].id and e.target_id == images[0].id
+    ]
+    assert len(reference_edges) == 1, "citing the caption's own label must resolve to a REFERENCES edge on the anchor, regardless of page/proximity"
     assert check_invariants(doc.nodes, doc.edges) == []
 
 

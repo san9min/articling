@@ -399,6 +399,34 @@ def build_xlsx_with_table_caption(path: Path) -> Path:
     return path
 
 
+def build_xlsx_with_table_caption_and_reference(path: Path) -> Path:
+    """Like `build_xlsx_with_table_caption`, plus a separate cell elsewhere
+    on the sheet that cites that same caption's label by name ("표1", no
+    space, the common Korean form) — for a regression test of
+    `scaffold.reference_label_edges`'s deterministic REFERENCES heuristic on
+    XLSX."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+
+    ws["B2"] = "표 1. 측정 결과"
+
+    thin = Side(style="thin")
+    border = Border(top=thin, left=thin, right=thin, bottom=thin)
+    ws["B4"] = "항목"
+    ws["C4"] = "값"
+    ws["B5"] = "토크"
+    ws["C5"] = "3.4 kgf"
+    for row in ws["B4:C5"]:
+        for cell in row:
+            cell.border = border
+
+    ws["B7"] = "표1 결과를 재확인할 것"
+
+    wb.save(str(path))
+    return path
+
+
 def build_pdf(path: Path, n_pages: int = 1) -> Path:
     """A synthetic PDF with text + image blocks. If `n_pages>1`, repeats a
     heading+body on each page — used for testing text/image extraction
@@ -507,6 +535,25 @@ def build_pdf_with_figure_caption(path: Path) -> Path:
     page = doc.new_page()
     page.insert_image(pymupdf.Rect(72, 72, 172, 132), stream=_tiny_png_bytes((90, 60, 200)))
     page.insert_text((72, 140), "Figure 1. Sample photo", fontsize=11)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def build_pdf_with_figure_reference(path: Path) -> Path:
+    """Page 1 has the same "Figure 1. …" caption as
+    `build_pdf_with_figure_caption`; page 2, with no image nearby at all,
+    cites that same label by name ("Figure 1") in an unrelated sentence —
+    for a regression test of `scaffold.reference_label_edges`'s
+    deterministic REFERENCES heuristic. Deliberately on a different page
+    from the caption/image (unlike `caption_prefix_edges`, which only looks
+    at immediate neighbors) to prove the label match isn't proximity-based."""
+    doc = pymupdf.open()
+    page1 = doc.new_page()
+    page1.insert_image(pymupdf.Rect(72, 72, 172, 132), stream=_tiny_png_bytes((90, 60, 200)))
+    page1.insert_text((72, 140), "Figure 1. Sample photo", fontsize=11)
+    page2 = doc.new_page()
+    page2.insert_text((72, 72), "As discussed in Figure 1, the results are consistent.", fontsize=11)
     doc.save(str(path))
     doc.close()
     return path

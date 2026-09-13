@@ -28,19 +28,23 @@ def main(argv: list[str] | None = None) -> int:
         "--vlm-enrichment", action="store_true",
         help=(
             "run relations.propose.apply_vlm_enrichment — merge semantic Text groups from the 2D layout and same-line fragments, "
-            "reparent heading Text as parents (promote_heading_parents, include_text_anchors=True), "
-            "nest numbered subheadings under their section (nest_numbered_headings), and "
-            "propose CAPTION_OF/REFERENCES (propose_edges) and add them to the edges (requires OPENAI_API_KEY)"
+            "propose CAPTION_OF/REFERENCES and reparent heading Text as parents in the same call (propose_edges, "
+            "include_text_anchors=True; a flat '1)/2)/3)...' enumerated-sibling run is asked about once and applied to "
+            "every member, not asked once per member), add the CAPTION_OF/REFERENCES proposals to the edges, then nest "
+            "numbered subheadings under their section (nest_numbered_headings) (requires OPENAI_API_KEY)"
         ),
     )
     parser.add_argument("--check", action="store_true", help="check scaffold invariants (PARENT_OF/NEXT integrity) and report to stderr")
     parser.add_argument("--slide-images", type=Path, help="JSON object mapping zero-based PPTX slide indices to PNG/JPEG paths (relative to the JSON file); requires --vlm-enrichment")
     parser.add_argument("--model", help="override the VLM model used by --vlm-enrichment (default: relations._config.DEFAULT_MODEL)")
+    parser.add_argument("--trace-dir", type=Path, help="save local VLM requests, image evidence, judgments and graph snapshots; requires --vlm-enrichment")
     args = parser.parse_args(argv)
     if args.slide_images and not args.vlm_enrichment:
         parser.error("--slide-images requires --vlm-enrichment")
     if args.model and not args.vlm_enrichment:
         parser.error("--model requires --vlm-enrichment")
+    if args.trace_dir and not args.vlm_enrichment:
+        parser.error("--trace-dir requires --vlm-enrichment")
 
     document = extract(args.path)
 
@@ -56,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
                 slide_images = {int(k): args.slide_images.parent / v for k, v in mapping.items()}
             except (OSError, ValueError) as exc:
                 parser.error(f"Invalid --slide-images manifest: {exc}")
-        apply_vlm_enrichment(document, model=args.model or DEFAULT_MODEL, slide_images=slide_images)
+        apply_vlm_enrichment(document, model=args.model or DEFAULT_MODEL, slide_images=slide_images, trace_dir=args.trace_dir)
 
     if args.check:
         problems = check_invariants(document.nodes, document.edges)

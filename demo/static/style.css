@@ -98,9 +98,9 @@ h1, h2, h3, p { margin: 0; }
 #topbar {
   display: flex;
   align-items: center;
-  gap: 20px;
-  padding: 0 20px;
-  height: 48px;
+  gap: 8px 20px;
+  padding: 8px 20px;
+  min-height: 48px;
   background: var(--canvas);
   border-bottom: 1px solid var(--hairline);
   flex: 0 0 auto;
@@ -126,7 +126,14 @@ h1, h2, h3, p { margin: 0; }
 .brand strong { font-weight: 600; }
 .brand .muted { font-size: 12px; letter-spacing: 0.32px; margin-left: 4px; }
 
-#uploadArea { display: flex; align-items: center; gap: 10px; }
+#uploadArea {
+  display: flex;
+  align-items: center;
+  gap: 8px 10px;
+  flex: 1 1 520px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
 
 .upload-btn {
   cursor: pointer;
@@ -151,13 +158,13 @@ h1, h2, h3, p { margin: 0; }
   letter-spacing: 0.32px;
   color: var(--ink-muted);
   cursor: pointer;
-  white-space: nowrap;
+  white-space: normal;
 }
-.checkbox-field input { accent-color: var(--primary); cursor: pointer; }
+.checkbox-field input { accent-color: var(--primary); cursor: pointer; flex-shrink: 0; }
 .checkbox-field:has(input:disabled) { cursor: default; opacity: 0.6; }
 .checkbox-field:has(input:disabled) input { cursor: default; }
 
-.vlm-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vlm-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
 
 .api-key-input {
   width: 190px;
@@ -175,9 +182,16 @@ h1, h2, h3, p { margin: 0; }
 
 #vlmHint { font-size: 11px; letter-spacing: 0.16px; }
 
-#fileMeta { font-size: 12px; letter-spacing: 0.32px; }
+#fileMeta { font-size: 12px; letter-spacing: 0.32px; min-width: 0; overflow-wrap: anywhere; }
 
-#statusArea { margin-left: auto; font-size: 12px; letter-spacing: 0.32px; }
+#statusArea {
+  flex: 1 1 100%;
+  min-width: 0;
+  font-size: 12px;
+  letter-spacing: 0.32px;
+  overflow-wrap: anywhere;
+}
+#statusArea:empty { display: none; }
 #statusArea.error { color: var(--error); }
 #statusArea.loading { color: var(--graph-blue); }
 #statusArea.ok { color: var(--success); }
@@ -283,6 +297,11 @@ h1, h2, h3, p { margin: 0; }
 .empty-hint {
   position: absolute;
   inset: 0;
+  /* Opaque, matching .pane-body's own resting background — this is also
+     reused as the loading overlay during a re-upload (showLoadingHint in
+     app.js), where it must fully hide whatever graph was already drawn on
+     the canvas underneath, not just float a spinner on top of it. */
+  background: var(--surface-1);
   display: flex;
   align-items: center;
   justify-content: center;

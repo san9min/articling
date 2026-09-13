@@ -41,6 +41,28 @@ Pillow. No LibreOffice, PowerPoint, AppleScript, or external converter runs:
 python -m articling.cli deck.pptx --vlm-enrichment --check -o graph.json
 ```
 
+For local diagnosis, add `--trace-dir /tmp/articling-traces` (SDK:
+`apply_vlm_enrichment(doc, trace_dir=...)` or `propose_edges(doc, trace_dir=...)`).
+Each run saves actual model inputs, image previews, parsed responses/nulls/API
+error types, heading candidate ID mappings, application/skip reasons, relation
+proposals, and graph snapshots. This is opt-in and contains document text and
+images; client credentials and exception messages are not recorded. It makes
+existing judgments inspectable offline; it does not replay API calls.
+
+Numbered headings are scoped to preceding, still-open sections within one
+Artifact. Native Word list identities do not bridge heading or parent
+boundaries, and `numId=0` is treated as numbering removal. Both heading
+reparenting and graph checks now guard against parent cycles.
+
+PDF extraction also restores tightly adjacent horizontal single-line text
+fragments before VLM enrichment. Matching baseline, font, size and color are
+required; intervening drawings/images block joining. Numeric-only fragments,
+rotated labels and multi-line groups remain separate. Nodes retain original
+`pdf_text_lines` (line/span geometry in PDF points), `pdf_block_numbers`, and
+`native_merged_by="same_line_continuation"` when joined; node `bbox` remains
+normalized to 0–1000. This conservative geometric heuristic does not establish
+semantic equivalence. Optional VLM passes still handle unresolved groups.
+
 Reconstruction reads source shapes in paint order, including background artwork,
 picture cropping/transparency/rotation, common shapes and connectors, text runs,
 and merged table cells. It preserves the slide aspect ratio. Font substitution
@@ -140,7 +162,23 @@ CAPTION_OF/REFERENCES proposals, requires `OPENAI_API_KEY`,
 checks) — see [references/cli.md](articling/.agents/skills/articling/references/cli.md)
 for the full flag list.
 
+For XLSX heading assignment, consecutive numbered text siblings share one
+VLM question. Tables and images anchored at the same row within a sheet
+share heading candidates while retaining separate judgments and their own
+caption/reference eligibility. See [relation enrichment details](articling/.agents/skills/articling/references/relations.md).
+
+For PPTX, each text block can select its parent heading from all other Text
+nodes on the same slide, so intervening sections cannot push the slide title
+out of its candidate window. The VLM still decides which heading owns it.
+The slide title is an eligible parent of top-level section blocks, including
+blocks that contain both a section heading and its body text.
+
 ### 3. Python usage
+
+PDF bookmarks establish native heading-to-heading hierarchy when their titles
+match extracted Text blocks; destination coordinates disambiguate repeated
+titles. This does not automatically assign all intervening body text to a
+section. Confirmed outline parents are preserved during VLM enrichment.
 
 ```python
 from articling import extract

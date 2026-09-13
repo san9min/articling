@@ -27,7 +27,8 @@ apply background color/font weight-color/alignment/merges — see each helper
 function for details.
 
 `annotate_standalone_image` applies the same shape compositing
-(rectangle/ellipse/connector, via `_load_sheet_shapes`) to a standalone
+(rectangle/ellipse/polygon presets/straight/bent/curved connectors, via
+`_load_sheet_shapes`) to a standalone
 Image that isn't inside any Table range too — fixing how, unlike table
 capture, a highlight box/arrow/label text placed on top of a photo outside
 any table used to be entirely lost because only the raw bytes were saved.
@@ -70,7 +71,7 @@ import zipfile
 from pathlib import Path
 
 from openpyxl.utils import get_column_letter
-from PIL import Image as PILImage, ImageDraw, ImageFont
+from PIL import Image as PILImage, ImageDraw, ImageFont, ImageOps
 
 from .number_format import format_cell_display
 
@@ -333,6 +334,35 @@ def _emu_to_px(emu: float) -> int:
     return round(emu / EMU_PER_INCH * DPI)
 
 
+def pic_anchor_flip(anchor) -> tuple[bool, bool]:
+    """The openpyxl picture anchor's own `pic/spPr/xfrm` `flipH`/`flipV` —
+    independent of `rot` (a flip mirrors the pixels; a rotation turns them).
+    `(False, False)` if the anchor has no `pic`/`spPr`/`xfrm` at all.
+    Confirmed as a real, silent bug on a real document: a screwdriver photo
+    placed as an annotation (`flipH="1"` in the source, meaning "show this
+    mirrored") was pasted as raw, un-mirrored bytes — every image-pasting
+    path in this module opened bytes and resized them, but none checked
+    this flag, so the tool that's held pointing one way in the original
+    photo rendered pointing the other way in every capture. `_apply_flip`
+    is the counterpart that actually mirrors the opened `PILImage`."""
+    try:
+        xfrm = anchor.pic.spPr.xfrm
+        return bool(xfrm.flipH), bool(xfrm.flipV)
+    except AttributeError:
+        return False, False
+
+
+def _apply_flip(image: PILImage.Image, flip_h: bool, flip_v: bool) -> PILImage.Image:
+    """Applies `flipH`/`flipV` (from `pic_anchor_flip`) to an opened raster
+    image. Order relative to resizing doesn't matter (mirroring commutes
+    with a uniform resize), so callers can call this right after `open()`."""
+    if flip_h:
+        image = ImageOps.mirror(image)
+    if flip_v:
+        image = ImageOps.flip(image)
+    return image
+
+
 def _cumulative_offsets(sizes: dict[int, int], start: int, end: int) -> dict[int, int]:
     offsets = {}
     acc = 0
@@ -530,9 +560,6 @@ def _xml_alpha(container: ET.Element) -> float:
     return 1.0
 
 
-_BENT_OR_CURVED_CONNECTOR_PREFIXES = ("bentConnector", "curvedConnector")
-
-
 def _xfrm_transform(sppr: ET.Element | None) -> tuple[bool, bool, float]:
     """Reads `spPr/xfrm`'s `flipH`/`flipV`/`rot` (in 1/60000ths of a degree,
     clockwise). All defaults if `xfrm` itself is absent (as for most shapes,
@@ -596,15 +623,21 @@ def _shape_style(
     return prst, fill, outline, rot_deg
 
 
-def _has_arrowhead(ln: ET.Element | None, tag: str) -> bool:
-    """Whether `<a:headEnd>`/`<a:tailEnd type="triangle|stealth|arrow|diamond|oval"/>`
-    exists under `<a:ln>`. No arrowhead if `type="none"` or the element
-    itself is absent. Drawn as a triangle approximation regardless of the
-    exact shape (triangle/diamond/oval etc.)."""
+def _arrowhead_type(ln: ET.Element | None, tag: str) -> str | None:
+    """The `type` of `<a:headEnd>`/`<a:tailEnd type="triangle|stealth|arrow|
+    diamond|oval">` under `<a:ln>` (e.g. `"diamond"`, `"oval"`), or `None` if
+    the element itself is absent or explicitly `type="none"` (no arrowhead
+    at all). `_draw_arrowhead` renders `"diamond"`/`"oval"` exactly and
+    falls back to a triangle for `"triangle"`/`"stealth"`/`"arrow"`/anything
+    else — narrower than before (previously every type was drawn as a
+    triangle with no distinction at all)."""
     if ln is None:
-        return False
+        return None
     end = ln.find(f"{_THEME_NS}{tag}")
-    return end is not None and end.get("type") not in (None, "none")
+    if end is None:
+        return None
+    t = end.get("type")
+    return None if t in (None, "none") else t
 
 
 def _load_sheet_shapes(xlsx_path: Path, ws) -> list[tuple[ET.Element, ET.Element, str]]:
@@ -656,13 +689,45 @@ def _load_sheet_shapes(xlsx_path: Path, ws) -> list[tuple[ET.Element, ET.Element
     return triples
 
 
+def _rotate_rect_center(
+    rect: tuple[int, int, int, int], pivot_rect: tuple[int, int, int, int], rot_deg: float
+) -> tuple[int, int, int, int]:
+    """Rotates `rect`'s center point around `pivot_rect`'s center by
+    `rot_deg` (OOXML's convention: clockwise, matching `spPr/xfrm`'s `rot`),
+    keeping `rect`'s own width/height unchanged. Used by
+    `_flatten_shape_entries` to reposition a group's child once the group
+    itself (`pivot_rect`) turns out to be rotated (see
+    `_expand_group_shapes`) — position only; the shape drawn at the returned
+    rect must separately add `rot_deg` to its own rotation for the shape
+    itself to visually turn in place (done by the caller, not here, since a
+    connector's endpoints and a filled shape's tile rotate through different
+    code paths)."""
+    px, py = (pivot_rect[0] + pivot_rect[2]) / 2, (pivot_rect[1] + pivot_rect[3]) / 2
+    cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+    w, h = rect[2] - rect[0], rect[3] - rect[1]
+    theta = math.radians(rot_deg)
+    dx, dy = cx - px, cy - py
+    # Plain 2D rotation applied directly in pixel space (y grows downward)
+    # visually reads as *clockwise* for a positive angle — the opposite of
+    # what the same formula means in standard (y-up) math coordinates — so
+    # no extra sign flip is needed to match OOXML's clockwise `rot`
+    # convention here (contrast `_paint_shape`, which negates the angle
+    # specifically to counteract PIL's `Image.rotate()` always turning
+    # counterclockwise for a positive argument).
+    new_dx = dx * math.cos(theta) - dy * math.sin(theta)
+    new_dy = dx * math.sin(theta) + dy * math.cos(theta)
+    new_cx, new_cy = px + new_dx, py + new_dy
+    return (round(new_cx - w / 2), round(new_cy - h / 2), round(new_cx + w / 2), round(new_cy + h / 2))
+
+
 def _expand_group_shapes(
     grp: ET.Element,
     group_rect: tuple[int, int, int, int],
-) -> list[tuple[tuple[int, int, int, int], ET.Element, str]]:
+) -> list[tuple[tuple[int, int, int, int], ET.Element, str, float]]:
     """Unpacks the sp/cxnSp inside an `xdr:grpSp` that a person actually
     grouped by selecting several shapes, returning them as a list of
-    (absolute pixel rectangle, element, kind).
+    (absolute pixel rectangle, element, kind, the group's own rotation in
+    degrees).
 
     Each child's position inside the group is written not relative to its
     own `spPr/xfrm` (off/ext) but relative to the **group's internal
@@ -674,20 +739,29 @@ def _expand_group_shapes(
     relative position (as a 0-1 fraction) within the `chOff`~`chOff+chExt`
     range onto that `group_rect` gives the child's absolute position — since
     the group coordinate system itself expresses "what % within this
-    rectangle," this is exact arithmetic when there's no rotation, not a
-    guess.
+    rectangle," this is exact arithmetic before any rotation is applied.
 
-    If the group itself is rotated (`rot`), the internal layout would need
-    that rotation composited back in to be accurate, which is out of this
-    project's scope (the same "don't guess" principle as skipping
-    `bentConnector`/`curvedConnector`) — such a group is skipped entirely.
-    Nested groups (a group inside a group) and an `xdr:pic` (an actual
-    image — getting its pixels needs unpacking drawing.xml's relationship
-    file too) inside a group are also out of scope for now."""
+    The 4th element of each result is the group's own `rot` (0.0 if
+    unrotated) — previously a rotated group was skipped entirely, since
+    compositing that rotation back into the child's position was considered
+    out of scope. It no longer is: the caller (`_flatten_shape_entries`)
+    rotates each child's rect around the group's own center by this angle
+    with `_rotate_rect_center`, and separately adds it to a `kind="sp"`
+    child's own rotation before painting (`_paint_shape`) — rotating a rigid
+    shape by its own angle and then carrying it along the group's rotation
+    about a different pivot is equivalent to rotating it in place by the sum
+    of both angles, so plain addition is exact, not an approximation. A
+    `kind="cxnSp"` connector inside a rotated group is only repositioned
+    this way, not additionally tilted (its own line angle stays as computed
+    from its un-rotated rect) — a further, still-documented approximation
+    for that rarer combination. Nested groups (a group inside a group) and
+    an `xdr:pic` (an actual image — getting its pixels needs unpacking
+    drawing.xml's relationship file too) inside a group are still out of
+    scope."""
     grp_sppr = grp.find(f"{_XDR_NS}grpSpPr")
     xfrm = grp_sppr.find(f"{_THEME_NS}xfrm") if grp_sppr is not None else None
-    if xfrm is None or xfrm.get("rot") not in (None, "0"):
-        return []  # no xfrm, or a rotated group (out of scope) — skip safely
+    if xfrm is None:
+        return []
     ch_off = xfrm.find(f"{_THEME_NS}chOff")
     ch_ext = xfrm.find(f"{_THEME_NS}chExt")
     if ch_off is None or ch_ext is None:
@@ -696,11 +770,13 @@ def _expand_group_shapes(
     ch_cx, ch_cy = int(ch_ext.get("cx", "0")), int(ch_ext.get("cy", "0"))
     if ch_cx == 0 or ch_cy == 0:
         return []
+    rot_raw = xfrm.get("rot")
+    group_rot_deg = int(rot_raw) / 60_000.0 if rot_raw else 0.0
 
     gx1, gy1, gx2, gy2 = group_rect
     gw, gh = gx2 - gx1, gy2 - gy1
 
-    results: list[tuple[tuple[int, int, int, int], ET.Element, str]] = []
+    results: list[tuple[tuple[int, int, int, int], ET.Element, str, float]] = []
     for tag, kind in ((f"{_XDR_NS}sp", "sp"), (f"{_XDR_NS}cxnSp", "cxnSp")):
         for child in grp.findall(tag):
             child_sppr = child.find(f"{_XDR_NS}spPr")
@@ -719,7 +795,7 @@ def _expand_group_shapes(
                 round(gx1 + fx1 * gw), round(gy1 + fy1 * gh),
                 round(gx1 + fx2 * gw), round(gy1 + fy2 * gh),
             )
-            results.append((rect, child, kind))
+            results.append((rect, child, kind, group_rot_deg))
     return results
 
 
@@ -730,32 +806,39 @@ def _flatten_shape_entries(
     row_off: dict[int, int],
     canvas_w: int,
     canvas_h: int,
-) -> list[tuple[ET.Element, tuple[int, int, int, int], ET.Element, str]]:
+) -> list[tuple[ET.Element, tuple[int, int, int, int], ET.Element, str, float]]:
     """Flattens the top-level shapes/connectors/groups found by
     `_load_sheet_shapes` into a list of (top-level anchor, for scope checks
     like "is it in the table range" / "does it overlap this image", absolute
-    pixel rectangle, element to draw, kind) that can actually be drawn —
-    shared preparation used by `capture_table_image`/
+    pixel rectangle, element to draw, kind, extra rotation in degrees to add
+    on top of the element's own `_shape_style` rotation) that can actually be
+    drawn — shared preparation used by `capture_table_image`/
     `annotate_standalone_image`. After flattening, kind is always just
     `"sp"`/`"cxnSp"` (groups disappear, replaced by their inner children, see
     `_expand_group_shapes`). A child that came out of a group still uses that
     group's top-level anchor for the caller's scope checks (in the table
     range or not, overlapping a particular image or not) — once something
     belongs to a group, it's natural to treat the whole group as one unit
-    for being in/out of scope."""
-    entries: list[tuple[ET.Element, tuple[int, int, int, int], ET.Element, str]] = []
+    for being in/out of scope. The extra-rotation element is 0.0 for
+    anything that isn't a rotated group's child — see `_expand_group_shapes`
+    and `_rotate_rect_center` for why the child's rect is repositioned here
+    (around the group's center) while the rotation angle itself is only
+    carried through for the caller to add at paint time."""
+    entries: list[tuple[ET.Element, tuple[int, int, int, int], ET.Element, str, float]] = []
     for anchor, elem, kind in _load_sheet_shapes(xlsx_path, ws):
         if kind == "grpSp":
             group_rect = _xml_anchor_rect(anchor, col_off, row_off, canvas_w, canvas_h)
             if group_rect is None:
                 continue
-            for child_rect, child_elem, child_kind in _expand_group_shapes(elem, group_rect):
-                entries.append((anchor, child_rect, child_elem, child_kind))
+            for child_rect, child_elem, child_kind, group_rot_deg in _expand_group_shapes(elem, group_rect):
+                if group_rot_deg:
+                    child_rect = _rotate_rect_center(child_rect, group_rect, group_rot_deg)
+                entries.append((anchor, child_rect, child_elem, child_kind, group_rot_deg))
             continue
-        rect = _xml_anchor_rect(anchor, col_off, row_off, canvas_w, canvas_h)
+        rect = _xml_anchor_rect(anchor, col_off, row_off, canvas_w, canvas_h, elem)
         if rect is None:
             continue
-        entries.append((anchor, rect, elem, kind))
+        entries.append((anchor, rect, elem, kind, 0.0))
     return entries
 
 
@@ -781,18 +864,123 @@ def shape_anchor_max_row_col(xlsx_path: Path, ws) -> tuple[int, int]:
     return max_row, max_col
 
 
+def _own_xfrm_ext_emu(elem: ET.Element) -> tuple[int, int] | None:
+    """The shape/connector/picture's own `spPr/xfrm/ext` (`cx`, `cy`) in
+    EMU, or `None` if absent or degenerate (`cx`/`cy` of 0 — a placeholder
+    some documents leave in place for a shape whose real size is meant to
+    track cell resizing, not a real zero-size shape)."""
+    sppr = elem.find(f"{_XDR_NS}spPr")
+    xfrm = sppr.find(f"{_THEME_NS}xfrm") if sppr is not None else None
+    ext = xfrm.find(f"{_THEME_NS}ext") if xfrm is not None else None
+    if ext is None:
+        return None
+    cx, cy = int(ext.get("cx", "0")), int(ext.get("cy", "0"))
+    return (cx, cy) if cx > 0 and cy > 0 else None
+
+
+def _own_xfrm_off_emu(elem: ET.Element) -> tuple[int, int] | None:
+    """The shape/connector's own `spPr/xfrm/off` (`x`, `y`) in EMU, or
+    `None` if absent. Unlike `ext` (which is only meaningfully redundant for
+    a *fixed-size* anchor), `off` isn't read by `_xml_anchor_rect` at all —
+    see `_calibrate_rect_from_offsets` for why: it's an absolute position
+    within the whole drawing part, so using it directly needs a shared
+    reference point (some other anchor whose own `off` and already-trusted
+    pixel position are both known), not just a local lookup."""
+    sppr = elem.find(f"{_XDR_NS}spPr")
+    xfrm = sppr.find(f"{_THEME_NS}xfrm") if sppr is not None else None
+    off = xfrm.find(f"{_THEME_NS}off") if xfrm is not None else None
+    if off is None:
+        return None
+    return int(off.get("x", "0")), int(off.get("y", "0"))
+
+
+def _pic_anchor_own_off_ext_emu(anchor) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """The openpyxl picture anchor's own cached `pic/spPr/xfrm`'s `off`
+    (x, y) and `ext` (cx, cy), both in EMU, or `None` if either is missing —
+    the same field `_own_xfrm_off_emu`/`_own_xfrm_ext_emu` read from raw XML
+    for a person-drawn shape, but reached through openpyxl's object model
+    here since the caller (`annotate_standalone_image`) already has the
+    parsed `Image`, not the raw XML element."""
+    try:
+        xfrm = anchor.pic.spPr.xfrm
+        off, ext = xfrm.off, xfrm.ext
+        return (int(off.x), int(off.y)), (int(ext.cx), int(ext.cy))
+    except AttributeError:
+        return None
+
+
+def _calibrate_rect_from_offsets(
+    reference_rect: tuple[int, int, int, int],
+    reference_off_emu: tuple[int, int],
+    target_off_emu: tuple[int, int],
+    target_ext_emu: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Positions `target` (a shape or another standalone image) relative to
+    `reference` (the specific image it's annotating) using the **EMU delta
+    between their own cached `spPr/xfrm/off` values**, converted directly to
+    pixels — not via `col_off`/`row_off`.
+
+    Both anchors' `off` live in the same absolute coordinate space (the
+    drawing part's own canvas — Excel writes it there regardless of
+    `editAs`), so this delta is exact arithmetic, unlike computing each
+    anchor's position independently through `_xml_anchor_rect`'s
+    `col_off[fc] + emu_to_px(fco)`: that sums `_sheet_mdw_px`'s
+    per-column pixel-width *estimate* over every column from the canvas
+    origin out to that anchor's own column, and the error compounds with
+    distance — confirmed on a real document where a red highlight box
+    annotating two screws was anchored 3 columns to the right of its photo;
+    computing its position independently (the old behavior) placed it a
+    photo's-width off, onto blank background, while this delta-from-the-
+    photo approach (only 3 columns' worth of *relative* error, not
+    12+ columns' worth of *absolute* error from the sheet's edge) lands it
+    back on the screws. `reference_rect` is whatever pixel rect the caller
+    already trusts for the reference photo (however that was computed) —
+    the delta is added on top of it, so this function doesn't need to know
+    where the sheet's own absolute origin is."""
+    dx = _emu_to_px(target_off_emu[0] - reference_off_emu[0])
+    dy = _emu_to_px(target_off_emu[1] - reference_off_emu[1])
+    w = max(1, _emu_to_px(target_ext_emu[0]))
+    h = max(1, _emu_to_px(target_ext_emu[1]))
+    x1, y1 = reference_rect[0] + dx, reference_rect[1] + dy
+    return (x1, y1, x1 + w, y1 + h)
+
+
 def _xml_anchor_rect(
     anchor: ET.Element,
     col_off: dict[int, int],
     row_off: dict[int, int],
     canvas_w: int,
     canvas_h: int,
+    elem: ET.Element | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Computes the pixel rectangle of an `<xdr:twoCellAnchor>`/
     `<xdr:oneCellAnchor>` (raw XML). A raw-XML repeat of the same
     from/to/ext + editAs rules `capture_table_image` uses for embedded
     images (can't reuse that one directly since this is an ElementTree, not
-    an openpyxl object, so it's rewritten in parallel)."""
+    an openpyxl object, so it's rewritten in parallel).
+
+    Position (x, y) always comes from the `from` corner + its cell/column
+    pixel offset — one column/row lookup, so it carries at most that one
+    column's share of `_sheet_mdw_px`'s width-estimation error.
+
+    Size is a different story for a genuinely resizing (`editAs="twoCell"`,
+    the default) anchor: the old code always re-derived it from the `to`
+    corner, which needs a *second, independent* column/row lookup that can
+    sit many columns away from `from` — the per-column MDW error compounds
+    across every column in between, and a highlight box anchored far from
+    its table/image (confirmed: a red `roundRect` annotating two screws,
+    anchored 3 columns past its photo, rendered 3 columns too far right,
+    landing on blank background instead of the screws) drifts by roughly
+    that accumulated error. `elem` (the `xdr:sp`/`xdr:cxnSp`/`xdr:pic` this
+    anchor wraps) is passed in so `_own_xfrm_ext_emu` can be checked first —
+    Excel writes that shape's actual current size there too (redundant with
+    the `to` corner only *if* our column-width estimate matches Excel's
+    own, which is exactly what can't be assumed), so preferring it sidesteps
+    the compounding entirely, the same way an `editAs="oneCell"`/`"absolute"`
+    anchor already had to (there `to` isn't authoritative for size at all).
+    Falls back to the old `to`-corner math when `elem` is omitted (e.g. a
+    `grpSp`'s own anchor, whose group-internal children are positioned by
+    `_expand_group_shapes` instead) or has no usable `ext`."""
     frm = anchor.find(f"{_XDR_NS}from")
     if frm is None:
         return None
@@ -810,7 +998,10 @@ def _xml_anchor_rect(
     ext = anchor.find(f"{_XDR_NS}ext")
     fixed_size = to is None or edit_as in ("oneCell", "absolute")
 
-    if to is not None and not fixed_size:
+    own_ext = _own_xfrm_ext_emu(elem) if elem is not None else None
+    if own_ext is not None:
+        w, h = max(1, _emu_to_px(own_ext[0])), max(1, _emu_to_px(own_ext[1]))
+    elif to is not None and not fixed_size:
         tc = int(to.findtext(f"{_XDR_NS}col", "0")) + 1
         tco = int(to.findtext(f"{_XDR_NS}colOff", "0"))
         tr = int(to.findtext(f"{_XDR_NS}row", "0")) + 1
@@ -895,6 +1086,75 @@ def _draw_shape_text(
         y += line_h
 
 
+def _regular_ngon_unit(n: int) -> list[tuple[float, float]]:
+    """A regular n-gon inscribed in the unit square [0,1]x[0,1], one vertex
+    pointing straight up — used as a stand-in for OOXML's
+    `pentagon`/`hexagon`/`heptagon`/`octagon` presets. Doesn't reproduce
+    their exact default `avLst` corner-cut geometry (a real `hexagon`
+    default, for instance, has flat left/right sides, not a vertex there) —
+    a documented approximation in the same spirit as `_apply_tint`."""
+    return [
+        (0.5 + 0.5 * math.cos(-math.pi / 2 + 2 * math.pi * i / n),
+         0.5 + 0.5 * math.sin(-math.pi / 2 + 2 * math.pi * i / n))
+        for i in range(n)
+    ]
+
+
+def _star_unit(n: int, inner_ratio: float) -> list[tuple[float, float]]:
+    """A `2n`-point star (n outer points at radius 0.5, n inner points at
+    `inner_ratio * 0.5`, alternating), one outer point straight up."""
+    points = []
+    for i in range(2 * n):
+        angle = -math.pi / 2 + math.pi * i / n
+        r = 0.5 if i % 2 == 0 else 0.5 * inner_ratio
+        points.append((0.5 + r * math.cos(angle), 0.5 + r * math.sin(angle)))
+    return points
+
+
+def _mirror_x_unit(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return [(1.0 - x, y) for x, y in points]
+
+
+def _mirror_y_unit(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return [(x, 1.0 - y) for x, y in points]
+
+
+def _swap_xy_unit(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return [(y, x) for x, y in points]
+
+
+_RIGHT_ARROW_UNIT = [(0.0, 0.3), (0.55, 0.3), (0.55, 0.1), (1.0, 0.5), (0.55, 0.9), (0.55, 0.7), (0.0, 0.7)]
+
+# Unit-square ([0,1]x[0,1]) outlines for `prstGeom` presets beyond the
+# rect/ellipse this module already drew exactly — arrows, callout/highlight
+# markers, diamond/star shapes actually seen annotating photos in this
+# project's Korean engineering documents. Each uses the preset's *default*
+# adjustment values only; a person-tweaked `avLst` override (e.g. a custom
+# arrowhead ratio) isn't read — an unlisted or overridden preset still falls
+# back to a plain rectangle in `_paint_shape`, same as before this table
+# existed, rather than guessing at a shape not represented here.
+_PRESET_UNIT_POLYGONS: dict[str, list[tuple[float, float]]] = {
+    "triangle": [(0.5, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    "rtTriangle": [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)],
+    "diamond": [(0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.0, 0.5)],
+    "parallelogram": [(0.25, 0.0), (1.0, 0.0), (0.75, 1.0), (0.0, 1.0)],
+    "trapezoid": [(0.2, 0.0), (0.8, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    "pentagon": _regular_ngon_unit(5),
+    "hexagon": _regular_ngon_unit(6),
+    "heptagon": _regular_ngon_unit(7),
+    "octagon": _regular_ngon_unit(8),
+    "chevron": [(0.0, 0.0), (0.75, 0.0), (1.0, 0.5), (0.75, 1.0), (0.0, 1.0), (0.25, 0.5)],
+    "homePlate": [(0.0, 0.0), (0.75, 0.0), (1.0, 0.5), (0.75, 1.0), (0.0, 1.0)],
+    "rightArrow": _RIGHT_ARROW_UNIT,
+    "leftArrow": _mirror_x_unit(_RIGHT_ARROW_UNIT),
+    "downArrow": _swap_xy_unit(_RIGHT_ARROW_UNIT),
+    "upArrow": _mirror_y_unit(_swap_xy_unit(_RIGHT_ARROW_UNIT)),
+    "star4": _star_unit(4, 0.42),
+    "star5": _star_unit(5, 0.38),
+    "star6": _star_unit(6, 0.55),
+}
+
+
 def _paint_shape(
     canvas: PILImage.Image,
     rect: tuple[int, int, int, int],
@@ -904,28 +1164,42 @@ def _paint_shape(
     rotation_deg: float = 0.0,
     text_lines: list[tuple[str, tuple[int, int, int], int]] | None = None,
 ) -> None:
-    """Draws a shape (rectangle/ellipse) within `rect` (bbox) and composites
-    it onto `canvas` (RGB). Always drawn on a separate RGBA tile first and
-    then pasted, uniformly — both semi-transparent fills and rotation go
-    through the same path (there's no separate special case for drawing
-    directly on the canvas), so branching doesn't grow. Rotation pivots on
-    the bbox center (the same convention as OOXML `rot`). If `text_lines` is
-    present (`_shape_text_lines`), the label text on the shape is drawn on
-    the same tile along with the rotation — it's visually correct for the
-    text on a rotated shape to rotate along with it.
+    """Draws a shape within `rect` (bbox) and composites it onto `canvas`
+    (RGB). `prst == "ellipse"` draws an exact ellipse; a name found in
+    `_PRESET_UNIT_POLYGONS` draws that polygon scaled to `rect`; anything
+    else (including plain `"rect"`) draws a rectangle — the same fallback as
+    before polygon presets were added, so an unrecognized preset still
+    renders as *something* close to its bbox rather than vanishing. Always
+    drawn on a separate RGBA tile first and then pasted, uniformly — both
+    semi-transparent fills and rotation go through the same path (there's no
+    separate special case for drawing directly on the canvas), so branching
+    doesn't grow. Rotation pivots on the bbox center (the same convention as
+    OOXML `rot`). If `text_lines` is present (`_shape_text_lines`), the
+    label text on the shape is drawn on the same tile along with the
+    rotation — it's visually correct for the text on a rotated shape to
+    rotate along with it.
     """
     x1, y1, x2, y2 = rect
     w, h = max(1, x2 - x1), max(1, y2 - y1)
     tile = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
     tile_draw = ImageDraw.Draw(tile)
-    shape_fn = tile_draw.ellipse if prst == "ellipse" else tile_draw.rectangle
     local_rect = (0, 0, w - 1, h - 1)
+
+    unit_polygon = _PRESET_UNIT_POLYGONS.get(prst)
+    if prst == "ellipse":
+        shape_fn, target = tile_draw.ellipse, local_rect
+    elif unit_polygon is not None:
+        shape_fn = tile_draw.polygon
+        target = [(ux * (w - 1), uy * (h - 1)) for ux, uy in unit_polygon]
+    else:
+        shape_fn, target = tile_draw.rectangle, local_rect
+
     if fill is not None:
         r, g, b, alpha = fill
-        shape_fn(local_rect, fill=(r, g, b, round(alpha * 255)))
+        shape_fn(target, fill=(r, g, b, round(alpha * 255)))
     if outline is not None:
         (r, g, b), width = outline
-        shape_fn(local_rect, outline=(r, g, b), width=width)
+        shape_fn(target, outline=(r, g, b), width=width)
     if text_lines:
         _draw_shape_text(tile_draw, local_rect, text_lines)
 
@@ -963,22 +1237,133 @@ def _connector_endpoints(
 
 
 def _draw_arrowhead(
-    draw: ImageDraw.ImageDraw, tip: tuple[float, float], other_end: tuple[float, float], size: float, rgb: tuple[int, int, int]
+    draw: ImageDraw.ImageDraw,
+    tip: tuple[float, float],
+    other_end: tuple[float, float],
+    size: float,
+    rgb: tuple[int, int, int],
+    head_type: str = "triangle",
 ) -> None:
-    """Draws a filled triangular arrowhead pointing from `other_end` to
-    `tip`. Doesn't distinguish the exact preset (triangle/stealth/diamond/
-    oval etc.) and approximates all of them as a triangle (see
-    `_has_arrowhead`)."""
+    """Draws an arrowhead pointing from `other_end` to `tip`, shaped per
+    `head_type` (from `_arrowhead_type`, `<a:headEnd|tailEnd type="...">`):
+    `"diamond"` draws a diamond and `"oval"` draws a filled circle exactly;
+    everything else (`"triangle"`/`"stealth"`/`"arrow"`/unrecognized) still
+    draws a triangle, the same approximation as before for those."""
     dx, dy = tip[0] - other_end[0], tip[1] - other_end[1]
     length = math.hypot(dx, dy)
     if length < 1e-6:
         return
     dx, dy = dx / length, dy / length
     px, py = -dy, dx  # unit vector perpendicular to the direction of travel
+    if head_type == "oval":
+        r = size * 0.5
+        draw.ellipse([tip[0] - r, tip[1] - r, tip[0] + r, tip[1] + r], fill=rgb)
+        return
     base_x, base_y = tip[0] - dx * size, tip[1] - dy * size
     left = (base_x + px * size * 0.5, base_y + py * size * 0.5)
     right = (base_x - px * size * 0.5, base_y - py * size * 0.5)
+    if head_type == "diamond":
+        back = (tip[0] - dx * size * 2, tip[1] - dy * size * 2)
+        draw.polygon([tip, left, back, right], fill=rgb)
+        return
     draw.polygon([tip, left, right], fill=rgb)
+
+
+def _cubic_bezier_points(
+    p0: tuple[float, float], p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float],
+    steps: int = 16,
+) -> list[tuple[float, float]]:
+    """Flattens a cubic Bezier curve into a polyline of `steps + 1` points —
+    PIL has no native curve primitive, so `_curved_connector_points` samples
+    the curve directly instead."""
+    points = []
+    for i in range(steps + 1):
+        t = i / steps
+        mt = 1 - t
+        x = mt**3 * p0[0] + 3 * mt**2 * t * p1[0] + 3 * mt * t**2 * p2[0] + t**3 * p3[0]
+        y = mt**3 * p0[1] + 3 * mt**2 * t * p1[1] + 3 * mt * t**2 * p2[1] + t**3 * p3[1]
+        points.append((x, y))
+    return points
+
+
+def _bent_connector_points(
+    rect: tuple[int, int, int, int], flip_h: bool, flip_v: bool
+) -> list[tuple[float, float]]:
+    """Default elbow routing for `bentConnector*` when no explicit
+    `<a:custGeom>`/adjustment-value path overrides it (the common case for a
+    person-drawn annotation arrow that hasn't been manually re-dragged) — a
+    single 90-degree bend at the horizontal midpoint between the two bbox
+    corners, matching the shape Office itself draws by default (the same
+    default `capture/pptx_capture.py`'s `_draw_line` already uses for
+    `bentConnector3`, generalized here to any `bentConnector*` variant since
+    a custom adjustment path is rare in this project's documents). Doesn't
+    parse `<a:custGeom>` overrides — a connector a person has manually
+    dragged to reroute keeps this default midpoint elbow instead (a
+    documented approximation, the same "don't guess further than this"
+    boundary as `_draw_arrowhead`'s head-shape fallback)."""
+    (x1, y1), (x2, y2) = _connector_endpoints(rect, flip_h, flip_v)
+    mid_x = (x1 + x2) / 2
+    return [(x1, y1), (mid_x, y1), (mid_x, y2), (x2, y2)]
+
+
+def _curved_connector_points(
+    rect: tuple[int, int, int, int], flip_h: bool, flip_v: bool
+) -> list[tuple[float, float]]:
+    """Default S-curve routing for `curvedConnector*` (no explicit path
+    override — same scope boundary as `_bent_connector_points`) — a cubic
+    Bezier whose control points sit at the horizontal midpoint, each at one
+    endpoint's own height, producing the smooth S shape Office draws by
+    default between two vertically-offset points. Flattened into a polyline
+    via `_cubic_bezier_points`."""
+    (x1, y1), (x2, y2) = _connector_endpoints(rect, flip_h, flip_v)
+    mid_x = (x1 + x2) / 2
+    return _cubic_bezier_points((x1, y1), (mid_x, y1), (mid_x, y2), (x2, y2))
+
+
+def _draw_connector(
+    draw: ImageDraw.ImageDraw,
+    rect: tuple[int, int, int, int],
+    elem: ET.Element,
+    prst: str,
+    outline: tuple[tuple[int, int, int], int] | None,
+) -> bool:
+    """Draws one `xdr:cxnSp` (straight/bent/curved connector) plus its
+    arrowheads onto `draw`. Shared by `capture_table_image` and
+    `annotate_standalone_image`, which previously each inlined an identical
+    copy of this block. Returns whether anything was actually drawn — an
+    outline color that couldn't be resolved (see `_shape_style`) draws
+    nothing and returns `False`, so a caller counting composited annotations
+    stays accurate; the "no guessing" rule stays the same as before.
+    `bentConnector*`/`curvedConnector*` used to be skipped outright (no
+    adjustment-value path formula was implemented) — now routed with the
+    same default midpoint elbow/S-curve Office itself draws before a person
+    manually reroutes the connector (see `_bent_connector_points`/
+    `_curved_connector_points`)."""
+    if outline is None:
+        return False
+    sppr = elem.find(f"{_XDR_NS}spPr")
+    flip_h, flip_v, _ = _xfrm_transform(sppr)
+    (r, g, b), width = outline
+    rgb = (r, g, b)
+
+    if prst.startswith("bentConnector"):
+        points = _bent_connector_points(rect, flip_h, flip_v)
+    elif prst.startswith("curvedConnector"):
+        points = _curved_connector_points(rect, flip_h, flip_v)
+    else:
+        points = list(_connector_endpoints(rect, flip_h, flip_v))
+
+    draw.line(points, fill=rgb, width=width, joint="curve" if len(points) > 2 else None)
+
+    ln = sppr.find(f"{_THEME_NS}ln") if sppr is not None else None
+    arrow_size = max(6.0, width * 3.0)
+    tail_type = _arrowhead_type(ln, "tailEnd")
+    if tail_type is not None:
+        _draw_arrowhead(draw, points[0], points[1], arrow_size, rgb, tail_type)
+    head_type = _arrowhead_type(ln, "headEnd")
+    if head_type is not None:
+        _draw_arrowhead(draw, points[-1], points[-2], arrow_size, rgb, head_type)
+    return True
 
 
 def _cell_fill_rgb(cell, theme_colors: list[str] | None) -> tuple[int, int, int] | None:
@@ -1032,6 +1417,94 @@ def _wrap_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFo
     return lines or [""]
 
 
+def _advance_col_by_width(ws, start_col: int, start_offset_px: int, width_px: int, mdw_px: float, limit: int = 500) -> int:
+    """The 1-based column reached by walking forward from `start_col`
+    (starting `start_offset_px` into it), accumulating each column's own
+    pixel width (`_col_width_px`), until `width_px` is fully covered — the
+    ending column a fixed-size (`ext`-based) image anchor's own width
+    actually reaches. `limit` bounds the walk so a pathological `ext`
+    can't loop forever."""
+    col = start_col
+    remaining = width_px - (_col_width_px(ws, col, mdw_px) - start_offset_px)
+    steps = 0
+    while remaining > 0 and steps < limit:
+        col += 1
+        remaining -= _col_width_px(ws, col, mdw_px)
+        steps += 1
+    return col
+
+
+def _advance_row_by_height(ws, start_row: int, start_offset_px: int, height_px: int, limit: int = 2000) -> int:
+    """Row counterpart of `_advance_col_by_width`, using `_row_height_px`."""
+    row = start_row
+    remaining = height_px - (_row_height_px(ws, row) - start_offset_px)
+    steps = 0
+    while remaining > 0 and steps < limit:
+        row += 1
+        remaining -= _row_height_px(ws, row)
+        steps += 1
+    return row
+
+
+def _embedded_image_overflow_bounds(
+    ws, min_row: int, min_col: int, max_row: int, max_col: int
+) -> tuple[int, int, int, int]:
+    """The (min_row, min_col, max_row, max_col) actually needed to fit every
+    embedded image whose `from` cell falls inside the table range
+    `[min_row,max_row] x [min_col,max_col]` — starting from that range
+    itself and widening outward only as far as an image's own anchor
+    actually reaches.
+
+    `capture_table_image`'s fixed `padding` (1 cell by default) is enough
+    for the *usual* case (a photo slightly overflowing its cell from
+    cell-size-estimation error), but not for a photo genuinely anchored
+    several columns/rows wide — confirmed on a real document: a wide
+    torque-gauge display screenshot in a table's last column got clipped at
+    the canvas edge, since the canvas was only ever sized to `padding`
+    cells past the table border regardless of how far the actual anchored
+    image reached.
+
+    A `TwoCellAnchor`'s own `to` corner gives this directly. A fixed-size
+    (`oneCell`/`absolute`) anchor has no `to` corner to read — its real
+    extent has to be derived by walking forward from its `from` cell,
+    accumulating column/row pixel widths (`_advance_col_by_width`/
+    `_advance_row_by_height`) until its own EMU `ext` is covered, the same
+    estimate `capture_table_image` already uses elsewhere for such an
+    anchor's size."""
+    mdw_px = _sheet_mdw_px(ws)
+    out_min_row, out_min_col, out_max_row, out_max_col = min_row, min_col, max_row, max_col
+    for img in getattr(ws, "_images", []):
+        anchor = img.anchor
+        fr = getattr(anchor, "_from", None)
+        if fr is None:
+            continue
+        r, c = fr.row + 1, fr.col + 1
+        if not (min_row <= r <= max_row and min_col <= c <= max_col):
+            continue  # not anchored inside this table — doesn't get to widen it
+
+        to = getattr(anchor, "to", None)
+        edit_as = getattr(anchor, "editAs", None)
+        fixed_size = to is None or edit_as in ("oneCell", "absolute")
+
+        if to is not None and not fixed_size:
+            end_row, end_col = to.row + 1, to.col + 1
+        else:
+            ext = getattr(anchor, "ext", None)
+            if ext is None:
+                try:
+                    ext = anchor.pic.spPr.xfrm.ext
+                except AttributeError:
+                    ext = None
+            if ext is None:
+                continue
+            end_col = _advance_col_by_width(ws, c, _emu_to_px(fr.colOff), _emu_to_px(ext.cx), mdw_px)
+            end_row = _advance_row_by_height(ws, r, _emu_to_px(fr.rowOff), _emu_to_px(ext.cy))
+
+        out_min_row, out_min_col = min(out_min_row, r), min(out_min_col, c)
+        out_max_row, out_max_col = max(out_max_row, end_row), max(out_max_col, end_col)
+    return out_min_row, out_min_col, out_max_row, out_max_col
+
+
 def capture_table_image(
     ws,
     min_row: int,
@@ -1050,7 +1523,11 @@ def capture_table_image(
     error, or a slight overflow present from the original), cropping the
     canvas exactly to the table size would clip that overflow — the margin
     is left blank with no gridlines/background/text, just providing room for
-    an image to overflow into.
+    an image to overflow into. This fixed margin is only a *floor*, not a
+    cap — `_embedded_image_overflow_bounds` widens the canvas further still
+    when an embedded image's own anchor reaches past it (a wide photo
+    genuinely anchored several columns/rows across, not just estimation
+    noise), so it's never clipped regardless of `padding`.
 
     `xlsx_path`: the original xlsx file's path. If given, shapes a person
     drew directly (highlight rectangles/ellipses, rotated shapes, arrows and
@@ -1058,18 +1535,18 @@ def capture_table_image(
     since openpyxl never parses these shapes (see `_load_sheet_shapes`), the
     zip has to be reopened, which needs the path. `None` (the default)
     keeps the old behavior of not drawing shapes (backward compatible).
-    Bent/curved connectors (`bentConnector*`/`curvedConnector*`) still
-    aren't supported, since they need an adjustment-value-based path
-    formula.
 
     Returns: (canvas width, canvas height, number of embedded images composited).
     """
     sheet_max_row = ws.max_row or max_row
     sheet_max_col = ws.max_column or max_col
-    pad_min_row = max(1, min_row - padding)
-    pad_max_row = min(sheet_max_row, max_row + padding)
-    pad_min_col = max(1, min_col - padding)
-    pad_max_col = min(sheet_max_col, max_col + padding)
+    img_min_row, img_min_col, img_max_row, img_max_col = _embedded_image_overflow_bounds(
+        ws, min_row, min_col, max_row, max_col
+    )
+    pad_min_row = min(max(1, min_row - padding), img_min_row)
+    pad_max_row = max(min(sheet_max_row, max_row + padding), img_max_row)
+    pad_min_col = min(max(1, min_col - padding), img_min_col)
+    pad_max_col = max(min(sheet_max_col, max_col + padding), img_max_col)
 
     mdw_px = _sheet_mdw_px(ws)
     row_h = {r: _row_height_px(ws, r) for r in range(pad_min_row, pad_max_row + 1)}
@@ -1230,6 +1707,7 @@ def capture_table_image(
             pic = PILImage.open(io.BytesIO(embedded._data())).convert("RGBA")
         except Exception:  # noqa: BLE001 — a format PIL can't open (an exceptional case) is skipped
             continue
+        pic = _apply_flip(pic, *pic_anchor_flip(anchor))
 
         x = col_off[c] + _emu_to_px(fr.colOff)
         y = row_off[r] + _emu_to_px(fr.rowOff)
@@ -1278,16 +1756,16 @@ def capture_table_image(
         canvas.paste(pic, (x, y), pic if pic.mode == "RGBA" else None)
         pasted += 1
 
-    # 5. Shapes a person drew directly (highlight rectangle/ellipse boxes,
-    # arrows, etc.) — drawn after (on top of) embedded images, since they're
-    # often used as annotations on a photo. A shape whose fill and outline
-    # both couldn't be read (only a theme style reference with no override,
-    # see `_shape_style`) is silently skipped rather than inventing a color.
-    # Bent/curved connectors (bentConnector/curvedConnector) still need an
-    # adjustment-value-based path formula and are out of scope — only
-    # straight connectors are supported.
+    # 5. Shapes a person drew directly (highlight rectangle/ellipse/polygon
+    # boxes, arrows, bent/curved connectors, etc.) — drawn after (on top of)
+    # embedded images, since they're often used as annotations on a photo. A
+    # shape whose fill and outline both couldn't be read (only a theme style
+    # reference with no override, see `_shape_style`) is silently skipped
+    # rather than inventing a color.
     if xlsx_path is not None:
-        for anchor, rect, elem, kind in _flatten_shape_entries(xlsx_path, ws, col_off, row_off, canvas_w, canvas_h):
+        for anchor, rect, elem, kind, extra_rot_deg in _flatten_shape_entries(
+            xlsx_path, ws, col_off, row_off, canvas_w, canvas_h
+        ):
             frm = anchor.find(f"{_XDR_NS}from")
             if frm is None:
                 continue
@@ -1297,6 +1775,7 @@ def capture_table_image(
                 continue  # not a shape anchored within this table range
 
             prst, fill, outline, rotation_deg = _shape_style(elem, theme_colors)
+            rotation_deg += extra_rot_deg  # a rotated group's child also carries the group's own rotation, see _expand_group_shapes
 
             if kind == "sp":
                 text_lines = _shape_text_lines(elem, theme_colors)
@@ -1305,20 +1784,7 @@ def capture_table_image(
                 _paint_shape(canvas, rect, prst, fill, outline, rotation_deg, text_lines)
                 continue
 
-            # kind == "cxnSp": only straight connectors are supported (see the comment above for bent/curved).
-            if prst.startswith(_BENT_OR_CURVED_CONNECTOR_PREFIXES) or outline is None:
-                continue
-            sppr = elem.find(f"{_XDR_NS}spPr")
-            flip_h, flip_v, _ = _xfrm_transform(sppr)
-            p1, p2 = _connector_endpoints(rect, flip_h, flip_v)
-            (r, g, b), width = outline
-            draw.line([p1, p2], fill=(r, g, b), width=width)
-            ln = sppr.find(f"{_THEME_NS}ln") if sppr is not None else None
-            arrow_size = max(6.0, width * 3.0)
-            if _has_arrowhead(ln, "tailEnd"):
-                _draw_arrowhead(draw, p1, p2, arrow_size, (r, g, b))
-            if _has_arrowhead(ln, "headEnd"):
-                _draw_arrowhead(draw, p2, p1, arrow_size, (r, g, b))
+            _draw_connector(draw, rect, elem, prst, outline)  # kind == "cxnSp"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
@@ -1393,7 +1859,7 @@ def annotate_standalone_image(
     canvas_w: int,
     canvas_h: int,
     out_path: Path,
-    overlay_images: list[tuple[bytes, tuple[int, int, int, int]]] | None = None,
+    overlay_images: list[tuple[bytes, tuple[int, int, int, int], bool, bool]] | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Composites annotations a person placed on top of a standalone Image
     that isn't inside any Table range (highlight rectangles/ellipses,
@@ -1417,8 +1883,9 @@ def annotate_standalone_image(
     once via `img._data()` before calling this function, so `img._data()`
     must not be called again here.
 
-    `overlay_images`: a list of (raw bytes, absolute pixel rectangle) for
-    **other standalone images** that overlap this one — `extractors/xlsx.py`
+    `overlay_images`: a list of (raw bytes, absolute pixel rectangle,
+    `flipH`, `flipV`) for **other standalone images** that overlap this one
+    — `extractors/xlsx.py`
     pre-checks whether standalone images outside any table overlap each
     other using `image_anchor_rect` and passes the result in (unlike
     `xdr:sp`/`xdr:cxnSp` shapes, which openpyxl can't parse, a photo placed
@@ -1455,27 +1922,68 @@ def annotate_standalone_image(
         pic = PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
     except Exception:  # noqa: BLE001 — e.g. a corrupted embedded image
         return None
+    flip_h, flip_v = pic_anchor_flip(img.anchor)
+    pic = _apply_flip(pic, flip_h, flip_v)
     w, h = image_rect[2] - image_rect[0], image_rect[3] - image_rect[1]
 
+    # This image's own cached absolute position — when present, every
+    # overlapping shape below is repositioned relative to *this*, via
+    # `_calibrate_rect_from_offsets`, instead of trusting `rect` as
+    # `_flatten_shape_entries` computed it independently through
+    # `col_off`/`row_off` (see that function's docstring for why an
+    # annotation shape anchored several columns from its photo can drift
+    # noticeably using that path alone).
+    image_off_ext_emu = _pic_anchor_own_off_ext_emu(img.anchor)
+
     theme_colors = _parse_theme_colors(ws.parent)
-    overlaps: list[tuple[ET.Element, str, tuple[int, int, int, int]]] = []
-    for _sh_anchor, rect, elem, kind in _flatten_shape_entries(xlsx_path, ws, col_off, row_off, canvas_w, canvas_h):
+    overlaps: list[tuple[ET.Element, str, tuple[int, int, int, int], float]] = []
+    for _sh_anchor, rect, elem, kind, extra_rot_deg in _flatten_shape_entries(
+        xlsx_path, ws, col_off, row_off, canvas_w, canvas_h
+    ):
+        # The column-based `rect` decides *whether* this shape belongs to
+        # this photo at all — checked first, before any calibration, and
+        # deliberately not "fixed up" here even though it's the same
+        # imprecise math `_calibrate_rect_from_offsets` exists to correct.
+        # Confirmed on a real document why: a shape's own cached `off` isn't
+        # reliably anchored to the *whole* sheet — a caption box 18 rows and
+        # 35 columns away from an unrelated photo had an `off` only ~150-260px
+        # from that photo's own `off` (evidently stale/local, not a live
+        # absolute position), which would make it wrongly "overlap" if the
+        # overlap decision itself were made post-calibration. The column
+        # math has no such failure mode (more columns of separation only
+        # ever pushes the estimate further away, never closer by
+        # coincidence), so it stays the gate; calibration only *refines* a
+        # shape already judged nearby, correcting drift within a
+        # neighborhood it's already confirmed to belong to.
         if not rects_overlap(rect, image_rect):
             continue
-        overlaps.append((elem, kind, rect))
+        if image_off_ext_emu is not None:
+            image_off_emu, _image_ext_emu = image_off_ext_emu
+            shape_off_emu = _own_xfrm_off_emu(elem)
+            shape_ext_emu = _own_xfrm_ext_emu(elem)
+            if shape_off_emu is not None and shape_ext_emu is not None:
+                rect = _calibrate_rect_from_offsets(image_rect, image_off_emu, shape_off_emu, shape_ext_emu)
+        overlaps.append((elem, kind, rect, extra_rot_deg))
 
     # Other overlapping standalone images — the caller already did the
     # overlap check before passing these in, but this function verifies it
     # again itself too (so that a caller mistake passing in a non-
     # overlapping one is silently ignored).
     valid_overlay_images = [
-        (data, rect) for data, rect in (overlay_images or []) if rects_overlap(rect, image_rect)
+        (data, rect, ov_flip_h, ov_flip_v)
+        for data, rect, ov_flip_h, ov_flip_v in (overlay_images or [])
+        if rects_overlap(rect, image_rect)
     ]
 
-    if not overlaps and not valid_overlay_images:
+    # A photo with no annotations and no overlapping images still needs
+    # this whole path when *it itself* carries flipH/flipV (see
+    # `pic_anchor_flip`) — otherwise the caller falls back to the raw,
+    # un-mirrored bytes it already saved, keeping the exact bug this
+    # function's flip handling exists to fix.
+    if not overlaps and not valid_overlay_images and not flip_h and not flip_v:
         return None
 
-    all_rects = [image_rect] + [r for _, _, r in overlaps] + [r for _, r in valid_overlay_images]
+    all_rects = [image_rect] + [r for _, _, r, _ in overlaps] + [r for _, r, _, _ in valid_overlay_images]
     ux1 = min(r[0] for r in all_rects)
     uy1 = min(r[1] for r in all_rects)
     ux2 = max(r[2] for r in all_rects)
@@ -1494,11 +2002,12 @@ def annotate_standalone_image(
     # person-drawn highlight shape is often the topmost layer over the
     # photos.
     image_drawn = 0
-    for data, rect in valid_overlay_images:
+    for data, rect, ov_flip_h, ov_flip_v in valid_overlay_images:
         try:
             overlay_pic = PILImage.open(io.BytesIO(data)).convert("RGBA")
         except Exception:  # noqa: BLE001 — e.g. a corrupted embedded image, skip just that one
             continue
+        overlay_pic = _apply_flip(overlay_pic, ov_flip_h, ov_flip_v)
         ow, oh = max(1, rect[2] - rect[0]), max(1, rect[3] - rect[1])
         overlay_pic = overlay_pic.resize((ow, oh))
         canvas.paste(overlay_pic, (rect[0] - ux1, rect[1] - uy1), overlay_pic)
@@ -1507,9 +2016,10 @@ def annotate_standalone_image(
     draw = ImageDraw.Draw(canvas)
 
     shape_drawn = 0
-    for elem, kind, rect in overlaps:
+    for elem, kind, rect, extra_rot_deg in overlaps:
         local_rect = (rect[0] - ux1, rect[1] - uy1, rect[2] - ux1, rect[3] - uy1)
         prst, fill, outline, rotation_deg = _shape_style(elem, theme_colors)
+        rotation_deg += extra_rot_deg  # a rotated group's child also carries the group's own rotation, see _expand_group_shapes
 
         if kind == "sp":
             text_lines = _shape_text_lines(elem, theme_colors)
@@ -1519,25 +2029,11 @@ def annotate_standalone_image(
             shape_drawn += 1
             continue
 
-        # kind == "cxnSp": only straight connectors are supported (same scope
-        # constraint as capture_table_image, see that comment).
-        if prst.startswith(_BENT_OR_CURVED_CONNECTOR_PREFIXES) or outline is None:
-            continue
-        sppr = elem.find(f"{_XDR_NS}spPr")
-        flip_h, flip_v, _ = _xfrm_transform(sppr)
-        p1, p2 = _connector_endpoints(local_rect, flip_h, flip_v)
-        (r, g, b), width = outline
-        draw.line([p1, p2], fill=(r, g, b), width=width)
-        ln = sppr.find(f"{_THEME_NS}ln") if sppr is not None else None
-        arrow_size = max(6.0, width * 3.0)
-        if _has_arrowhead(ln, "tailEnd"):
-            _draw_arrowhead(draw, p1, p2, arrow_size, (r, g, b))
-        if _has_arrowhead(ln, "headEnd"):
-            _draw_arrowhead(draw, p2, p1, arrow_size, (r, g, b))
-        shape_drawn += 1
+        if _draw_connector(draw, local_rect, elem, prst, outline):  # kind == "cxnSp"
+            shape_drawn += 1
 
-    if shape_drawn == 0 and image_drawn == 0:
-        return None
+    if shape_drawn == 0 and image_drawn == 0 and not flip_h and not flip_v:
+        return None  # nothing was actually composited or flipped — let the caller keep its raw bytes
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)

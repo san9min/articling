@@ -66,13 +66,14 @@ from ..capture.xlsx_capture import (
     build_sheet_grid,
     capture_table_image,
     image_anchor_rect,
+    pic_anchor_flip,
     rects_overlap,
     shape_anchor_max_row_col,
     sheet_font_metrics_measured,
 )
 from ..capture.xlsx_chart_capture import extract_chart_data, parse_theme_colors, render_chart_image
 from ..schema import ArticDocument, Edge, Node, NodeType
-from ..scaffold import file_node, parent_edges, resolve_capture_dir, save_image_bytes
+from ..scaffold import caption_prefix_edges, file_node, parent_edges, reference_label_edges, resolve_capture_dir, save_image_bytes
 
 
 def _table_ranges(ws) -> dict[tuple[int, int, int, int], str]:
@@ -587,17 +588,20 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
                 saved = save_image_bytes(capture_root, stem, data, f".{fmt.lower()}")
                 props["image_path"] = str(saved.resolve())
 
-                # Pre-collect the raw bytes + absolute rectangle of other
-                # overlapping standalone images (absorption targets) —
-                # annotate_standalone_image composites them together with
-                # the shapes.
-                overlay_images: list[tuple[bytes, tuple[int, int, int, int]]] = []
+                # Pre-collect the raw bytes + absolute rectangle + flipH/flipV
+                # of other overlapping standalone images (absorption
+                # targets) — annotate_standalone_image composites them
+                # together with the shapes, mirroring each one that needs it
+                # (see pic_anchor_flip's docstring for why: an image's own
+                # flip is otherwise silently dropped).
+                overlay_images: list[tuple[bytes, tuple[int, int, int, int], bool, bool]] = []
                 for ov_idx in overlay_idx_list:
                     ov_rect = standalone_rects.get(ov_idx)
                     if ov_rect is None:
                         continue
                     try:
-                        overlay_images.append((images[ov_idx]._data(), ov_rect))
+                        ov_flip_h, ov_flip_v = pic_anchor_flip(images[ov_idx].anchor)
+                        overlay_images.append((images[ov_idx]._data(), ov_rect, ov_flip_h, ov_flip_v))
                     except Exception:  # noqa: BLE001 — e.g. a corrupted embedded image, skip just that one
                         continue
 
@@ -684,6 +688,16 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
         content.sort(key=lambda n: (n.properties.get("row", 0), n.properties.get("col", 0)))
         nodes.extend(content)
         edges.extend(parent_edges(artifact, content))
+
+        # Same deterministic CAPTION_OF/REFERENCES heuristics docx.py/pdf.py/
+        # pptx.py use — a standalone text cell right above/below a
+        # table/chart/image (in row/col reading order, same as `content`'s
+        # own sort just above) starting with "표 "/"Table "/... is its
+        # caption, and any other cell on the sheet citing that same label by
+        # name (e.g. "Table 1") gets a REFERENCES edge to it.
+        caption_edges = caption_prefix_edges(content)
+        edges.extend(caption_edges)
+        edges.extend(reference_label_edges(content, caption_edges))
 
     # Sheets aren't linked by NEXT to each other — NEXT is currently only
     # used for pptx.py's slide order.

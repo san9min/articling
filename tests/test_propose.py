@@ -23,11 +23,11 @@ from articling.relations.propose import (  # noqa: E402
     _FragmentMergeDecision, _HeadingParentBatchResult, _HeadingParentChoice,
     _SemanticRegionBatchResult, _SemanticRegionDecision, _SemanticTextGroup,
     _SiblingRegionBatchResult, _SiblingRegionDecision, _SyntheticGroupCandidate,
-    _build_document_context_windows, _find_same_line_text_clusters,
-    _find_semantic_text_regions, _propose_for_anchor,
+    _build_document_context_windows, _enumerated_sibling_groups, _find_same_line_text_clusters,
+    _find_semantic_text_regions, _propose_for_anchor, _propose_text_heading_parents, _widen_row_sibling_windows,
     apply_vlm_enrichment, build_context_windows, merge_fragmented_text,
     merge_semantic_text_groups, nest_numbered_headings,
-    promote_heading_parents, propose_edges, propose_synthetic_groups, resolve_ambiguous_captions,
+    propose_edges, propose_synthetic_groups, resolve_ambiguous_captions,
 )
 from articling.schema import ArticDocument, Edge, EdgeType, Node, NodeType  # noqa: E402
 from articling.scaffold import check_invariants  # noqa: E402
@@ -69,6 +69,15 @@ def _pdf_text(id_: str, text: str, bbox: dict, page_index: int = 0) -> Node:
         id=id_, type=NodeType.TEXT, name=text[:20],
         properties={"text": text, "bbox": bbox, "page_index": page_index},
     )
+
+
+def _reparented_ids(doc: ArticDocument) -> list[str]:
+    """`propose_edges`'s HEADING_PARENT judgment doesn't return the ids it
+    reparented (see its docstring) — every anchor it actually reparents
+    carries `properties["reparented_from"]` on its new PARENT_OF edge, which
+    is how a caller (and these tests) recovers the same list
+    `promote_heading_parents` used to return directly."""
+    return [e.target_id for e in doc.edges if e.type == EdgeType.PARENT_OF and "reparented_from" in e.properties]
 
 
 def test_build_context_windows_pairs_anchor_with_nearby_text() -> None:
@@ -119,7 +128,7 @@ def test_propose_for_anchor_attaches_image_when_pixel_path_exists(tmp_path: Path
     fake_result = _EdgeProposalResult(proposals=[_EdgeProposal(context_index=0, edge_type="CAPTION_OF", rationale="match")])
     client = _FakeClient(fake_result)
 
-    edges = _propose_for_anchor(client, "gpt-5.6-terra", anchor, [candidate])
+    edges, heading_choice = _propose_for_anchor(client, "gpt-5.6-terra", anchor, [candidate])
 
     assert len(client.responses.calls) == 1
     content = client.responses.calls[0]["input"][0]["content"]
@@ -130,6 +139,7 @@ def test_propose_for_anchor_attaches_image_when_pixel_path_exists(tmp_path: Path
     assert len(edges) == 1
     assert edges[0].source_id == "t1"
     assert edges[0].target_id == "tbl1"
+    assert heading_choice is None
 
 
 def test_propose_for_anchor_falls_back_to_text_when_no_pixel_path() -> None:
@@ -219,34 +229,35 @@ def test_propose_edges_skips_anchor_on_api_failure() -> None:
     assert proposals[0].target_id == "img1"
 
 
-def test_promote_heading_parents_reparents_when_model_picks_heading() -> None:
+def test_propose_edges_reparents_heading_when_model_picks_one() -> None:
     """If the model picks a heading among the candidates, the PARENT_OF
     that was Artifact->Image must be reparented to heading Text->Image
-    (deepening the tree)."""
+    (deepening the tree) — judged in the same call as CAPTION_OF/REFERENCES
+    now, via the HEADING_PARENT role."""
     heading = _text("h1", "3. 측정 결과")
     img1 = Node(id="img1", type=NodeType.IMAGE, name="이미지", properties={})
     other = _text("t2", "본문 설명")
     doc = ArticDocument(
         source_path="x", format="docx",
-        nodes=[heading, img1, other],
-        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="img1")],
+        nodes=[Node(id="art1", type=NodeType.ARTIFACT, name="art1"), heading, img1, other],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id) for n in (heading, img1, other)],
     )
-    fake_result = _HeadingParentBatchResult(
-        choices=[_HeadingParentChoice(anchor_index=0, parent_index=0, rationale="측정 결과 섹션 제목")]
+    fake_result = _EdgeProposalResult(
+        proposals=[_EdgeProposal(context_index=0, edge_type="HEADING_PARENT", rationale="측정 결과 섹션 제목")]
     )
     client = _FakeClient(fake_result)
 
-    promoted = promote_heading_parents(doc, client=client, window=3)
+    proposals = propose_edges(doc, client=client, window=3)
 
-    assert promoted == ["img1"]
-    parent_of = [e for e in doc.edges if e.type == EdgeType.PARENT_OF]
+    assert proposals == [], "HEADING_PARENT is applied directly, never returned as a proposal"
+    parent_of = [e for e in doc.edges if e.type == EdgeType.PARENT_OF and e.target_id == "img1"]
     assert len(parent_of) == 1, "the old structural edge must be removed, leaving only one new edge"
     assert parent_of[0].source_id == "h1" and parent_of[0].target_id == "img1"
     assert parent_of[0].properties["reparented_from"] == "art1"
     assert check_invariants(doc.nodes, doc.edges) == [], "the fan-in<=1 invariant must still hold after reparenting"
 
 
-def test_promote_heading_parents_leaves_structure_when_model_finds_no_heading() -> None:
+def test_propose_edges_leaves_structure_when_model_finds_no_heading() -> None:
     heading = _text("h1", "그냥 아무 문단")
     img1 = Node(id="img1", type=NodeType.IMAGE, name="이미지", properties={})
     doc = ArticDocument(
@@ -254,18 +265,18 @@ def test_promote_heading_parents_leaves_structure_when_model_finds_no_heading() 
         nodes=[heading, img1],
         edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="img1")],
     )
-    fake_result = _HeadingParentBatchResult(
-        choices=[_HeadingParentChoice(anchor_index=0, parent_index=None, rationale="헤딩 아님")]
+    fake_result = _EdgeProposalResult(
+        proposals=[_EdgeProposal(context_index=0, edge_type="NONE", rationale="헤딩 아님")]
     )
     client = _FakeClient(fake_result)
 
-    promoted = promote_heading_parents(doc, client=client, window=3)
+    proposals = propose_edges(doc, client=client, window=3)
 
-    assert promoted == []
+    assert proposals == []
     assert doc.edges == [Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="img1")]
 
 
-def test_promote_heading_parents_skips_anchor_on_api_failure() -> None:
+def test_propose_edges_leaves_heading_structure_on_api_failure() -> None:
     """Even if the API call fails (a rate limit, etc.), that anchor's
     original structure (Artifact as parent) must be left as-is, following
     the same partial-failure principle as the other batch code."""
@@ -275,13 +286,13 @@ def test_promote_heading_parents_skips_anchor_on_api_failure() -> None:
     doc = ArticDocument(source_path="x", format="docx", nodes=[heading, img1], edges=[original_edge])
     client = _SequencedClient([RuntimeError("simulated API error")])
 
-    promoted = promote_heading_parents(doc, client=client, window=3)
+    proposals = propose_edges(doc, client=client, window=3)
 
-    assert promoted == []
+    assert proposals == []
     assert doc.edges == [original_edge]
 
 
-def test_promote_heading_parents_default_ignores_text_anchors() -> None:
+def test_propose_edges_default_ignores_text_anchors_for_heading() -> None:
     """With `include_text_anchors` defaulting to False, Text never becomes a
     reparent target (anchor), and if the document has no Table/Image at
     all, there must be no API call whatsoever — backward compatibility."""
@@ -297,14 +308,14 @@ def test_promote_heading_parents_default_ignores_text_anchors() -> None:
     )
     client = _FakeClient(fake_result)
 
-    promoted = promote_heading_parents(doc, client=client, window=3)
+    proposals = propose_edges(doc, client=client, window=3)
 
-    assert promoted == []
+    assert proposals == []
     assert len(client.responses.calls) == 0, "with no Table/Image, Text must not become an anchor"
     assert doc.edges == [Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="body")]
 
 
-def test_promote_heading_parents_reparents_text_under_text_when_included() -> None:
+def test_propose_edges_reparents_text_under_text_when_included() -> None:
     """With `include_text_anchors=True`, a body paragraph Text can also be
     reparented under a heading Text — the "Text-Text PARENT_OF" case a user
     requested."""
@@ -312,28 +323,26 @@ def test_promote_heading_parents_reparents_text_under_text_when_included() -> No
     body = _text("body", "이 섹션은 배경을 설명한다")
     doc = ArticDocument(
         source_path="x", format="docx",
-        nodes=[heading, body],
-        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="body")],
+        nodes=[Node(id="art1", type=NodeType.ARTIFACT, name="art1"), heading, body],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id) for n in (heading, body)],
     )
     # anchor_index 0=heading (candidates=[body]), 1=body (candidates=[heading])
-    # — an answer where heading picks body as its parent is silently
-    # ignored since h1 has no existing PARENT_OF (the original code does the
-    # same), so filling in only body's answer is enough.
+    # Only the body chooses a heading; the heading remains under Artifact.
     fake_result = _HeadingParentBatchResult(
         choices=[_HeadingParentChoice(anchor_index=1, parent_index=0, rationale="개요 섹션 소속")]
     )
     client = _FakeClient(fake_result)
 
-    promoted = promote_heading_parents(doc, client=client, window=3, include_text_anchors=True)
+    propose_edges(doc, client=client, window=3, include_text_anchors=True)
 
-    assert promoted == ["body"]
-    parent_of = [e for e in doc.edges if e.type == EdgeType.PARENT_OF]
+    assert _reparented_ids(doc) == ["body"]
+    parent_of = [e for e in doc.edges if e.type == EdgeType.PARENT_OF and e.target_id == "body"]
     assert len(parent_of) == 1
     assert parent_of[0].source_id == "h1" and parent_of[0].target_id == "body"
     assert check_invariants(doc.nodes, doc.edges) == []
 
 
-def test_promote_heading_parents_skips_reparent_that_would_create_cycle() -> None:
+def test_propose_edges_skips_reparent_that_would_create_cycle() -> None:
     """The cycle risk that arises once Text can be both parent and child —
     with a->b already linked, if the model picks b as a's new parent (the
     opposite direction), that would create a cycle, so it must be skipped.
@@ -360,21 +369,21 @@ def test_promote_heading_parents_skips_reparent_that_would_create_cycle() -> Non
     )
     client = _FakeClient(fake_result)
 
-    promoted = promote_heading_parents(doc, client=client, window=3, include_text_anchors=True)
+    propose_edges(doc, client=client, window=3, include_text_anchors=True)
 
-    assert promoted == [], "a reparent that creates a cycle must not be applied"
+    assert _reparented_ids(doc) == [], "a reparent that creates a cycle must not be applied"
     assert doc.edges == edges, "the original structure must be preserved as-is"
     assert check_invariants(doc.nodes, doc.edges) == []
     assert len(client.responses.calls) == 1, "the 2 pixel-less anchors must be processed as one batch (1 call)"
 
 
-def test_promote_heading_parents_processes_pixel_and_text_only_anchors_separately(tmp_path: Path) -> None:
-    """An anchor with a pixel (a Table's `capture_path`) must be handled
-    with an individual call to avoid mixing several images into one batch,
-    while a pixel-less anchor must be handled with a batched call — both
-    run concurrently on the same thread pool, but the reparent result must
-    be correct for both (2026-09-05, `docs/vlm-integration-research.md`
-    §14)."""
+def test_propose_edges_processes_table_and_text_only_anchors_separately(tmp_path: Path) -> None:
+    """A Table/Image anchor always gets an individual call (it's judged
+    together with CAPTION_OF/REFERENCES in `_propose_for_anchor`, pixel or
+    not), while a Text anchor with no pixel is still batched with other
+    text-only Text anchors — both run concurrently on the same thread pool,
+    but the reparent result must be correct for both (2026-09-05,
+    `docs/vlm-integration-research.md` §14)."""
     png = tmp_path / "capture.png"
     png.write_bytes(b"\x89PNG\r\n\x1a\n")
     heading = _text("h1", "1. 개요")
@@ -382,72 +391,191 @@ def test_promote_heading_parents_processes_pixel_and_text_only_anchors_separatel
     body = _text("body", "본문 문단")
     doc = ArticDocument(
         source_path="x", format="docx",
-        nodes=[heading, tbl1, body],
+        nodes=[Node(id="art1", type=NodeType.ARTIFACT, name="art1"), heading, tbl1, body],
         edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="h1"),
             Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="tbl1"),
             Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="body"),
         ],
     )
 
-    # tbl1 (has a pixel): picks heading (index 0) among candidates=[heading,
-    # body] — an individual call. heading/body (no pixel, text_only):
-    # processed together in one batch — filling in only body's answer is
+    # tbl1 (Table anchor): picks heading (index 0) among candidates=[heading,
+    # body] — an individual call, via _EdgeProposalResult (the merged
+    # CAPTION_OF/REFERENCES/HEADING_PARENT schema). heading/body (Text
+    # anchors, no pixel): processed together in one batch via the older
+    # _HeadingParentBatchResult schema — filling in only body's answer is
     # enough (heading's own reparent attempt is ignored since h1 has no
     # existing edge, the same pattern as the other tests above).
     client = _ShapeAwareClient({
-        _HeadingParentChoice: _HeadingParentChoice(parent_index=0, rationale="개요 섹션 소속(표)"),
+        _EdgeProposalResult: _EdgeProposalResult(
+            proposals=[_EdgeProposal(context_index=0, edge_type="HEADING_PARENT", rationale="개요 섹션 소속(표)")]
+        ),
         _HeadingParentBatchResult: _HeadingParentBatchResult(
             choices=[_HeadingParentChoice(anchor_index=1, parent_index=0, rationale="개요 섹션 소속(본문)")]
         ),
     })
 
-    promoted = promote_heading_parents(doc, client=client, window=3, include_text_anchors=True)
+    propose_edges(doc, client=client, window=3, include_text_anchors=True)
 
-    assert set(promoted) == {"tbl1", "body"}
-    assert len(client.responses.calls) == 2, "pixel anchor (1 individual call) + pixel-less anchors (1 batch call) = 2 calls total"
+    assert set(_reparented_ids(doc)) == {"tbl1", "body"}
+    assert len(client.responses.calls) == 2, "table anchor (1 individual call) + pixel-less text anchors (1 batch call) = 2 calls total"
     parent_by_target = {e.target_id: e.source_id for e in doc.edges if e.type == EdgeType.PARENT_OF}
     assert parent_by_target["tbl1"] == "h1"
     assert parent_by_target["body"] == "h1"
     assert check_invariants(doc.nodes, doc.edges) == []
 
 
-def test_apply_vlm_enrichment_runs_promotion_then_proposal() -> None:
-    """apply_vlm_enrichment runs promote_heading_parents and propose_edges
-    in order with the same client, so both the structural reparent
+def test_apply_vlm_enrichment_runs_heading_and_caption_from_one_call() -> None:
+    """apply_vlm_enrichment's `propose_edges` judges HEADING_PARENT and
+    CAPTION_OF/REFERENCES for the same Table/Image anchor in **one call**
+    now (the merge in this session) — both the structural reparent
     (PARENT_OF) and the edge proposal (CAPTION_OF) must be reflected in doc
-    — the behavior the CLI --vlm-enrichment/demo checkbox expects.
+    from that single response, the behavior the CLI --vlm-enrichment/demo
+    checkbox expects.
     (merge_fragmented_text also runs first, but this test's nodes have no
     bbox/page_index so no cluster is caught, making it a silent no-op with
-    no API call — the call count of 2 below stays the same.)"""
+    no API call — the call count of 1 below stays the same.)"""
     heading = _text("h1", "3. 측정 결과")
     img1 = Node(id="img1", type=NodeType.IMAGE, name="이미지", properties={})
     caption = _text("t2", "그림 1. 측정 결과 사진")
     doc = ArticDocument(
         source_path="x", format="docx",
-        nodes=[heading, img1, caption],
-        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="img1")],
+        nodes=[Node(id="art1", type=NodeType.ARTIFACT, name="art1"), heading, img1, caption],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id) for n in (heading, img1, caption)],
     )
 
-    # the first call is promote_heading_parents (one img1 anchor = 1 batch
-    # call, candidates=[heading, caption]): picks the heading (index 0). The
-    # second call is propose_edges for the same anchor (not batched, as-is):
-    # proposes that caption (index 1) is a CAPTION_OF img1.
-    heading_result = _HeadingParentBatchResult(
-        choices=[_HeadingParentChoice(anchor_index=0, parent_index=0, rationale="측정 결과 섹션 제목")]
-    )
+    # the one and only call is for the img1 anchor (candidates=[heading,
+    # caption]): picks the heading (index 0) as HEADING_PARENT and caption
+    # (index 1) as CAPTION_OF, both in the same _EdgeProposalResult.
     edge_result = _EdgeProposalResult(
-        proposals=[_EdgeProposal(context_index=1, edge_type="CAPTION_OF", rationale="그림 1로 명시적 지칭")]
+        proposals=[
+            _EdgeProposal(context_index=0, edge_type="HEADING_PARENT", rationale="측정 결과 섹션 제목"),
+            _EdgeProposal(context_index=1, edge_type="CAPTION_OF", rationale="그림 1로 명시적 지칭"),
+        ]
     )
-    client = _SequencedClient([heading_result, edge_result])
+    client = _FakeClient(edge_result)
 
     promoted = apply_vlm_enrichment(doc, client=client, include_text_anchors=False)
 
-    assert promoted == ["img1"], "must return exactly the reparented-node id list that promote_heading_parents returned"
-    parent_of = [e for e in doc.edges if e.type == EdgeType.PARENT_OF]
+    assert promoted == ["img1"], "must return exactly the node ids propose_edges's HEADING_PARENT judgment reparented"
+    parent_of = [e for e in doc.edges if e.type == EdgeType.PARENT_OF and e.target_id == "img1"]
     assert len(parent_of) == 1 and parent_of[0].source_id == "h1", "PARENT_OF must be reparented under the heading"
     caption_edges = [e for e in doc.edges if e.type == EdgeType.CAPTION_OF]
     assert len(caption_edges) == 1 and caption_edges[0].source_id == "t2", "the propose_edges proposal must be added to doc.edges"
-    assert len(client.responses.calls) == 2, "must be called twice total: once for heading reparent, once for edge proposal"
+    assert len(client.responses.calls) == 1, "HEADING_PARENT and CAPTION_OF/REFERENCES are judged in one call per anchor now"
+
+
+def test_propose_edges_excludes_own_caption_proposal_from_text_anchor_candidates() -> None:
+    """End-to-end reproduction of a real pptx failure mode: a Table/Image
+    anchor's own CAPTION_OF proposal (from the merged call) must feed
+    directly into the separate Text-anchor HEADING_PARENT pass's exclusion
+    set, within the same `propose_edges` call — no separate step needed.
+    Once `caption` is proposed as `image`'s CAPTION_OF, it must never again
+    appear as a *candidate* in the batched Text-anchor prompt — only in its
+    own anchor line."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="art1", properties={})
+    image = Node(id="image", type=NodeType.IMAGE, name="이미지", properties={})
+    caption = _text("caption", "스팀 유입 부")
+    real_heading = _text("real_heading", "■ 재현 시험 결과")
+    target = _text("target", "□ 재현 시험 내용 - 동작 조건 : ...")
+    doc = ArticDocument(
+        source_path="x", format="docx",
+        nodes=[art1, image, caption, real_heading, target],
+        edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id)
+            for n in (image, caption, real_heading, target)
+        ],
+    )
+
+    # image's own candidates=[caption, real_heading, target]: caption
+    # (index 0) gets proposed as its CAPTION_OF.
+    edge_result = _EdgeProposalResult(
+        proposals=[_EdgeProposal(context_index=0, edge_type="CAPTION_OF", rationale="이미지 바로 아래의 캡션")]
+    )
+    # caption/real_heading/target have no pixel/layout crop for docx, so
+    # they're batched into one Text-anchor call — answer "no parent" for
+    # everyone, since this test only cares about what candidates they see.
+    heading_result = _HeadingParentBatchResult(
+        choices=[_HeadingParentChoice(anchor_index=i, parent_index=None, rationale="no parent") for i in range(3)]
+    )
+
+    class ShapeAwareResponses:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            result = edge_result if kwargs["text_format"] is _EdgeProposalResult else heading_result
+            return _FakeResponse(result)
+
+    class ShapeAwareClient:
+        def __init__(self):
+            self.responses = ShapeAwareResponses()
+
+    client = ShapeAwareClient()
+    proposals = propose_edges(doc, client=client, window=3, include_text_anchors=True)
+
+    assert any(p.type == EdgeType.CAPTION_OF and p.source_id == "caption" for p in proposals)
+
+    heading_call = next(c for c in client.responses.calls if c["text_format"] is _HeadingParentBatchResult)
+    batch_prompt = heading_call["input"][0]["content"]
+    assert batch_prompt.count("스팀 유입 부") == 1, (
+        "the caption must appear only in its own anchor line, never again as "
+        "another anchor's candidate, once it's been proposed as image's CAPTION_OF"
+    )
+
+
+def test_apply_vlm_enrichment_collapses_enumerated_siblings_into_one_question() -> None:
+    """End-to-end reproduction of the real xlsx failure mode, fixed at the
+    source rather than patched after the fact: with `include_text_anchors=True`
+    (the default), a flat "1) .../2) .../3) ..." run is asked about **once**
+    (using "1)"'s own candidate window, the one closest to — and so most
+    likely to still reach — the shared heading), and that single answer is
+    applied to every member. "2)" and "3)" never become separate questions
+    at all, so there's no window to run out for "3)" and nothing to
+    disagree with "1)"."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="art1", properties={})
+    heading = _text("heading", "■ 창문형에어컨 전도 건 검토")
+    item1 = _text("item1", "1) 현상 : ...")
+    item2 = _text("item2", "2) 원인 : ...")
+    sub = _text("sub", "- 메커니즘 : ...")
+    item3 = _text("item3", "3) 창문형에어컨 측면고정 스크류 체결강도 검토")
+    doc = ArticDocument(
+        source_path="x", format="docx",
+        nodes=[art1, heading, item1, item2, sub, item3],
+        edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="heading"),
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="item1"),
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="item2"),
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="sub"),
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="item3"),
+        ],
+    )
+
+    # "item1"/"item2"/"item3" form one run; "item1" is the representative, so
+    # "item2"/"item3" are pruned from the anchor list entirely before any
+    # call is made — only heading(0)/item1(1)/sub(2) remain as anchors.
+    # item1's own candidates are [heading, item2, sub, item3] (item2/item3
+    # still appear as *candidate text*, just not as their own questions) —
+    # "heading" sits at index 0.
+    heading_result = _HeadingParentBatchResult(
+        choices=[
+            _HeadingParentChoice(anchor_index=0, parent_index=None, rationale="no parent"),
+            _HeadingParentChoice(anchor_index=1, parent_index=0, rationale="under the section heading"),
+            _HeadingParentChoice(anchor_index=2, parent_index=None, rationale="not a heading candidate"),
+        ]
+    )
+    client = _FakeClient(heading_result)
+
+    promoted = apply_vlm_enrichment(doc, client=client)
+
+    parent_by_target = {e.target_id: e.source_id for e in doc.edges if e.type == EdgeType.PARENT_OF}
+    assert parent_by_target["item1"] == "heading"
+    assert parent_by_target["item2"] == "heading", "the whole run inherits item1's answer, never asked separately"
+    assert parent_by_target["item3"] == "heading", "including the member whose own window would have missed the heading"
+    assert {"item1", "item2", "item3"} <= set(promoted)
+    assert len(client.responses.calls) == 1
+    assert check_invariants(doc.nodes, doc.edges) == []
 
 
 def test_nest_numbered_headings_reparents_subsections_under_their_section() -> None:
@@ -524,6 +652,49 @@ def test_nest_numbered_headings_leaves_orphan_when_parent_section_missing() -> N
 
     assert nested == []
     assert doc.edges == [Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="h_51")]
+
+
+def test_enumerated_sibling_groups_groups_consecutive_markers_within_one_artifact() -> None:
+    """"1)"/"2)"/"3)" with consecutive, increasing-by-1 numbers form one
+    group regardless of what non-matching content (a sub-bullet) sits
+    between them; a restart back to "1)" under a different heading starts a
+    new, separate group instead of extending the first."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="art1", properties={})
+    item1 = _text("item1", "1) 현상 : ...")
+    item2 = _text("item2", "2) 원인 : ...")
+    sub = _text("sub", "- 메커니즘 : ...")
+    item3 = _text("item3", "3) 결론 : ...")
+    restart1 = _text("restart1", "1) 대책 : ...")
+    doc = ArticDocument(
+        source_path="x", format="xlsx",
+        nodes=[art1, item1, item2, sub, item3, restart1],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id) for n in (item1, item2, sub, item3, restart1)],
+    )
+
+    groups = _enumerated_sibling_groups(doc)
+
+    assert [n.id for n in groups[0]] == ["item1", "item2", "item3"]
+    assert len(groups) == 1, "a lone restarted '1)' with no '2)' following it forms no group of its own"
+
+
+def test_enumerated_sibling_groups_ignores_table_data_rows() -> None:
+    """Not everything starting with "N)" is an enumerated item — a value
+    like "2) 512 512" (a digit right after the marker) must not be mistaken
+    for one, the same safeguard `nest_numbered_headings` uses for its own
+    pattern."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="art1", properties={})
+    item1 = _text("item1", "1) 현상 : ...")
+    fake_row = _text("row", "2) 512 512 5.29")  # a digit follows the marker — not an enumerated item
+    doc = ArticDocument(
+        source_path="x", format="xlsx",
+        nodes=[art1, item1, fake_row],
+        edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="item1"),
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id="row"),
+        ],
+    )
+
+    assert _enumerated_sibling_groups(doc) == [], "a single real enumerated item with no matching sibling forms no group"
 
 
 def test_find_same_line_text_clusters_groups_by_y_overlap_and_x_order() -> None:
@@ -1063,6 +1234,178 @@ def test_pptx_context_windows_choose_spatially_nearest_text() -> None:
     assert [node.id for node in windows[0][1]] == ["near", "far"]
 
 
+
+def test_pptx_text_heading_window_reaches_title_across_four_sections() -> None:
+    """PBA review slide: page number and four section blocks used to push
+    the title outside the last two sections' three-Text reading window.
+    A repeated title on another slide must not become a candidate.
+    """
+    slide = Node(id="slide", type=NodeType.ARTIFACT, name="Slide")
+    other_slide = Node(id="other_slide", type=NodeType.ARTIFACT, name="Other")
+    specs = [
+        ("title", "■ 청소로봇 Main PBA 수분 유입 건", (22, 28, 371, 81)),
+        ("page", "2", (14, 32, 49, 90)),
+        ("benchmark", "□ 주요 경쟁사 PBA 코팅 BM", (476, 113, 893, 167)),
+        ("history", "□ 개발단계 검토 이력", (22, 122, 432, 425)),
+        ("coating", "□ 컨포멀코팅 도포 영역", (28, 531, 446, 645)),
+        ("plans", "□ 향후 계획", (469, 603, 899, 1077)),
+    ]
+    texts = [_text(node_id, text) for node_id, text, _ in specs]
+    for node, (_, _, box) in zip(texts, specs):
+        node.properties.update(slide_index=0, bbox=_bbox(*box))
+    other_title = _text("other_title", specs[0][1])
+    doc = ArticDocument(
+        source_path="x", format="pptx", nodes=[slide, *texts, other_slide, other_title],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="slide", target_id=n.id) for n in texts]
+        + [Edge(type=EdgeType.PARENT_OF, source_id="other_slide", target_id="other_title")],
+    )
+    windows = _build_document_context_windows(
+        doc, window=3, anchor_types=(NodeType.TEXT,), boundary_types=(),
+    )
+    by_anchor = {a.id: [c.id for c in candidates] for a, candidates in windows}
+    for section in ("benchmark", "history", "coating", "plans"):
+        assert "title" in by_anchor[section]
+        assert "other_title" not in by_anchor[section]
+        assert section not in by_anchor[section]
+    assert by_anchor["plans"][0] != "title"  # proximity still ranks, but never truncates
+
+def test_xlsx_table_heading_window_stays_spatial_even_with_boundary_types_empty() -> None:
+    """Regression (found on a real xlsx document in this session): a
+    Table/Image anchor's own HEADING_PARENT window (`boundary_types=()`,
+    judged together with CAPTION_OF/REFERENCES) must keep using xlsx's
+    spatial-distance ranking — only `propose_edges`'s separate Text-anchor
+    HEADING_PARENT pass switches to reading-order scanning for
+    `boundary_types=()`. Reusing reading-order scanning for a Table/Image
+    anchor too let 4 reading-order-adjacent but spatially-distant lines
+    (a large column offset) crowd out the table's actual heading — spatially
+    close (same column, small row gap) but positioned further back in
+    reading order than the window's Text-count budget could reach — and it
+    broke a real Table→heading pairing that spatial ranking already got
+    right."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="Sheet1", properties={})
+    heading = _text("heading", "< Section Heading >")
+    heading.properties.update(row=10, col=1)
+    fillers = []
+    for i, row in enumerate((15, 16, 17, 18), start=1):
+        f = _text(f"filler{i}", f"filler line {i}")
+        f.properties.update(row=row, col=100)
+        fillers.append(f)
+    table = Node(
+        id="tbl1", type=NodeType.TABLE, name="표",
+        properties={"grid": [["a"]], "range": "R20C1:R25C5"},
+    )
+    doc = ArticDocument(
+        source_path="x", format="xlsx",
+        nodes=[art1, heading, *fillers, table],
+        edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id)
+            for n in (heading, *fillers, table)
+        ],
+    )
+
+    windows = _build_document_context_windows(
+        doc, window=3, anchor_types=(NodeType.TABLE, NodeType.IMAGE), boundary_types=()
+    )
+
+    assert len(windows) == 1
+    candidate_ids = [n.id for n in windows[0][1]]
+    assert candidate_ids[0] == "heading", "the spatially nearest candidate (same column, small row gap) must rank first"
+    assert "heading" in candidate_ids, (
+        "reading-order scanning would have excluded it entirely — the 4 filler lines "
+        "(all closer in reading order) would fill the whole window first"
+    )
+
+
+def test_widen_row_sibling_windows_shares_heading_across_same_row_images() -> None:
+    """Regression (found on a real xlsx document in this session) —
+    reproduces the confirmed row/col/range geometry exactly: 4 photos
+    anchored at the exact same row, illustrating one bullet, each have a
+    different spatial HEADING_PARENT window purely because of which column
+    they sit in. The one sharing its column with two unrelated nearby lines
+    (a numbered item two bullets below, and its own elaboration — both
+    single-cell, so they don't reach other columns) had those outrank its
+    actual section heading entirely — while its 3 row-siblings, sitting far
+    enough right to fall outside those single-cell lines' column but still
+    inside the *heading*'s and "2) 원인"'s wide merged-cell ranges, had the
+    heading rank fine on their own. Once widened with the union of same-row
+    siblings' candidates, every member gets a fair shot at the heading, not
+    just whichever happens to dodge the distracting column."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="Sheet1", properties={})
+    heading = _text("heading", "■ Section Heading")
+    heading.properties.update(row=2, col=2, range="R2C2:R2C27")
+    item2 = _text("item2", "2) 원인 : ...")
+    item2.properties.update(row=6, col=2, range="R6C2:R6C67")
+    mechanism = _text("mechanism", "- 메커니즘 : ...")
+    mechanism.properties.update(row=8, col=2, range="R8C2:R8C2")
+    item3 = _text("item3", "3) 창문형에어컨 측면고정 스크류 체결강도 검토")
+    item3.properties.update(row=12, col=2, range="R12C2:R12C2")
+    crowded_img = Node(id="img_crowded", type=NodeType.IMAGE, name="Image", properties={"row": 10, "col": 2})
+    clean_imgs = [
+        Node(id=f"img_clean{i}", type=NodeType.IMAGE, name="Image", properties={"row": 10, "col": col})
+        for i, col in enumerate((9, 17, 38), start=1)
+    ]
+    doc = ArticDocument(
+        source_path="x", format="xlsx",
+        nodes=[art1, heading, item2, mechanism, item3, crowded_img, *clean_imgs],
+        edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id)
+            for n in (heading, item2, mechanism, item3, crowded_img, *clean_imgs)
+        ],
+    )
+
+    wide_windows = _build_document_context_windows(
+        doc, window=3, anchor_types=(NodeType.TABLE, NodeType.IMAGE), boundary_types=()
+    )
+    before = {a.id: {c.id for c in cands} for a, cands in wide_windows}
+    assert "heading" not in before["img_crowded"], "sanity check: the crowded image's own window must miss the heading"
+    assert all("heading" in before[img.id] for img in clean_imgs), "sanity check: the clean images' own windows must already have it"
+
+    widened = _widen_row_sibling_windows(doc, wide_windows)
+    after = {a.id: {c.id for c in cands} for a, cands in widened}
+
+    assert "heading" in after["img_crowded"], "the crowded image must inherit the heading from its row-siblings"
+    assert all("heading" in after[img.id] for img in clean_imgs), "the already-fine siblings must keep seeing it too"
+
+
+def test_widen_row_sibling_windows_includes_table_not_just_image() -> None:
+    """A Table shares row-sibling widening with an Image at the same row —
+    this project treats Table/Image as one class of anchor everywhere else
+    (`_DEFAULT_ANCHOR_TYPES`), and a small summary table next to a couple of
+    photos at the same row is a plausible real layout, so the same fix
+    shouldn't be Image-only. Same crowded/clean geometry as the Image-only
+    test above, except the crowded member is now a Table."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="Sheet1", properties={})
+    heading = _text("heading", "■ Section Heading")
+    heading.properties.update(row=2, col=2, range="R2C2:R2C27")
+    item2 = _text("item2", "2) 원인 : ...")
+    item2.properties.update(row=6, col=2, range="R6C2:R6C67")
+    mechanism = _text("mechanism", "- 메커니즘 : ...")
+    mechanism.properties.update(row=8, col=2, range="R8C2:R8C2")
+    item3 = _text("item3", "3) 창문형에어컨 측면고정 스크류 체결강도 검토")
+    item3.properties.update(row=12, col=2, range="R12C2:R12C2")
+    crowded_table = Node(id="tbl_crowded", type=NodeType.TABLE, name="표", properties={"grid": [["a"]], "row": 10, "col": 2})
+    clean_img = Node(id="img_clean", type=NodeType.IMAGE, name="Image", properties={"row": 10, "col": 38})
+    doc = ArticDocument(
+        source_path="x", format="xlsx",
+        nodes=[art1, heading, item2, mechanism, item3, crowded_table, clean_img],
+        edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id)
+            for n in (heading, item2, mechanism, item3, crowded_table, clean_img)
+        ],
+    )
+
+    wide_windows = _build_document_context_windows(
+        doc, window=3, anchor_types=(NodeType.TABLE, NodeType.IMAGE), boundary_types=()
+    )
+    before = {a.id: {c.id for c in cands} for a, cands in wide_windows}
+    assert "heading" not in before["tbl_crowded"], "sanity check: the crowded table's own window must miss the heading"
+
+    widened = _widen_row_sibling_windows(doc, wide_windows)
+    after = {a.id: {c.id for c in cands} for a, cands in widened}
+
+    assert "heading" in after["tbl_crowded"], "the crowded table must inherit the heading from its row-sibling image"
+
+
 def test_propose_edges_attaches_pptx_slide_pixels(tmp_path: Path) -> None:
     """Relations receive an attached real slide plus the individual image."""
     pptx_path = build_pptx(tmp_path / "layout.pptx")
@@ -1090,15 +1433,20 @@ def test_propose_edges_attaches_pptx_slide_pixels(tmp_path: Path) -> None:
     ), "an Image anchor must receive both the individual image and the slide layout map"
 
 
-def test_promote_heading_parents_attaches_xlsx_layout_crop(tmp_path: Path) -> None:
-    """XLSX hierarchy judgment must also receive the same real sheet crop as relation judgment does."""
+def test_propose_edges_attaches_xlsx_layout_crop_for_heading(tmp_path: Path) -> None:
+    """XLSX HEADING_PARENT judgment must also receive the same real sheet
+    crop as CAPTION_OF/REFERENCES judgment — they're judged in the same
+    call now, via `_EdgeProposalResult`."""
     xlsx_path = build_xlsx_with_table_caption(tmp_path / "heading.xlsx")
     doc = xlsx_extractor.extract(xlsx_path, capture_dir=tmp_path / "captures")
-    client = _FakeClient(_HeadingParentChoice(parent_index=0, rationale="title directly above the table"))
+    fake_result = _EdgeProposalResult(
+        proposals=[_EdgeProposal(context_index=0, edge_type="HEADING_PARENT", rationale="title directly above the table")]
+    )
+    client = _FakeClient(fake_result)
 
-    promoted = promote_heading_parents(doc, client=client, max_workers=1)
+    propose_edges(doc, client=client, max_workers=1)
 
-    assert promoted
+    assert _reparented_ids(doc)
     content = client.responses.calls[0]["input"][0]["content"]
     assert isinstance(content, list)
     assert any(block["type"] == "input_image" for block in content)
@@ -1121,3 +1469,82 @@ def test_pptx_plot_labels_do_not_exclude_caption_or_cross_slide() -> None:
     ids = [n.id for n in windows[0][1]]
     assert 'before' in ids and 'other-caption' not in ids
     assert len(ids) == 6
+
+
+def test_heading_failure_is_reported_without_discarding_other_anchors(caplog) -> None:
+    """An API failure must be distinguishable from a valid no-parent choice,
+    while successful siblings still receive their proposed heading.
+    """
+    import logging
+    title = _text("title", "Main title")
+    broken = _text("broken", "Broken section")
+    good = _text("good", "Good section")
+    slide = Node(id="slide", type=NodeType.ARTIFACT, name="Slide")
+    doc = ArticDocument(source_path="x", format="pptx", nodes=[slide, title, broken, good], edges=[
+        Edge(type=EdgeType.PARENT_OF, source_id="slide", target_id=n.id)
+        for n in (title, broken, good)
+    ])
+    class Responses:
+        def parse(self, **kwargs):
+            prompt = kwargs["input"][0]["content"][0]["text"].split("Candidate nodes")[0]
+            if "Broken section" in prompt:
+                raise RuntimeError("private error details")
+            return _FakeResponse(_HeadingParentChoice(
+                parent_index=0 if "Good section" in prompt else None,
+                rationale="Main title owns this section" if "Good section" in prompt else "No parent",
+            ))
+    class Client:
+        responses = Responses()
+    with caplog.at_level(logging.WARNING):
+        reparents = _propose_text_heading_parents(
+            doc, Client(), "test", 3, layout_crop_fn=lambda a, cs: b"png",
+            batch_size=25, max_workers=1,
+        )
+    assert [(a.id, h.id) for a, h, _ in reparents] == [("good", "title")]
+    assert "Heading judgment failed for broken (RuntimeError)" in caplog.text
+    assert "private error details" not in caplog.text
+
+
+def test_propose_text_heading_parents_excludes_known_caption_candidates() -> None:
+    """A Text already judged to caption/reference a Table/Image must not
+    also be offered as some *other* anchor's HEADING_PARENT candidate —
+    confirmed on a real pptx document: a short image caption with no
+    recognizable label prefix (so undetected by the deterministic
+    heuristics) got mistakenly picked as an unrelated Text's section
+    heading, purely because nothing had disqualified it as a candidate."""
+    slide = Node(id="slide", type=NodeType.ARTIFACT, name="Slide")
+    caption = _text("caption", "스팀 유입 부")
+    real_heading = _text("real_heading", "■ 재현 시험 결과")
+    target = _text("target", "□ 재현 시험 내용 - 동작 조건 : ...")
+    doc = ArticDocument(
+        source_path="x", format="pptx",
+        nodes=[slide, caption, real_heading, target],
+        edges=[
+            Edge(type=EdgeType.PARENT_OF, source_id="slide", target_id=n.id)
+            for n in (caption, real_heading, target)
+        ],
+    )
+
+    seen_prompts: list[str] = []
+
+    class Responses:
+        def parse(self, **kwargs):
+            content = kwargs["input"][0]["content"]
+            prompt = content[0]["text"] if isinstance(content, list) else content
+            seen_prompts.append(prompt)
+            return _FakeResponse(_HeadingParentChoice(parent_index=0, rationale="the only real heading left"))
+
+    class Client:
+        responses = Responses()
+
+    reparents = _propose_text_heading_parents(
+        doc, Client(), "test", 3, layout_crop_fn=lambda a, cs: b"png",
+        batch_size=25, max_workers=1, excluded_candidate_ids={"caption"},
+    )
+
+    target_prompt = next(p for p in seen_prompts if "재현 시험 내용" in p.split("Candidate nodes")[0])
+    assert "스팀 유입 부" not in target_prompt, "the caption must be dropped from the candidate list entirely, not just deprioritized"
+    assert "재현 시험 결과" in target_prompt, "the real heading must still be offered"
+
+    target_reparent = next((h for a, h, _ in reparents if a.id == "target"), None)
+    assert target_reparent is not None and target_reparent.id == "real_heading"

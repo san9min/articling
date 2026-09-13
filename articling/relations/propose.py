@@ -1,4 +1,5 @@
-"""LLM/VLM-based CAPTION_OF/REFERENCES edge proposals — no coordinate guessing.
+"""LLM/VLM-based CAPTION_OF/REFERENCES/heading-PARENT_OF edge proposals — no
+coordinate guessing.
 
 Core design: since extractors/*.py already gives accurate nodes with **real
 source text**, this asks only "what's the relationship between these two
@@ -17,15 +18,71 @@ Scope limiting: asking about every possible node pair is a combinatorial
 explosion plus heavy noise. For each Table/Image node, only its nearby
 neighbors in NEXT order (N before/after) are given as "context candidates,"
 and only relationships to those candidates are judged — on the assumption
-that a caption/reference appears spatially/positionally nearby.
+that a caption/reference/heading appears spatially/positionally nearby.
+
+`propose_edges` judges three independent roles a candidate Text can have
+relative to one Table/Image anchor — CAPTION_OF, REFERENCES, and
+HEADING_PARENT — in **one VLM call per anchor**, since they're all answered
+by looking at the same anchor + the same nearby candidates; asking three
+separate questions over the same material would triple the API cost for no
+accuracy gain. `include_text_anchors=True` additionally judges HEADING_PARENT
+for Text anchors too (a paragraph Text reparented under its own section
+heading) — CAPTION_OF/REFERENCES never apply there (a Text doesn't caption
+another Text in this schema), so that part runs as its own batched pass; see
+"Batching and concurrency" below.
+
+For CAPTION_OF/REFERENCES, `propose_edges` is a **corrective pass**, not the
+primary source of either edge type — `scaffold.caption_prefix_edges`/
+`reference_label_edges` already catch every case with an explicit marker (a
+"표 "/"Table "/... prefix, or a "Figure 1"/"표1" citation elsewhere in the
+text) deterministically, for free, before this ever runs. This only exists
+for the harder remainder: a description or citation with no such marker at
+all. That's why NONE should be the default answer, not CAPTION_OF/REFERENCES
+— a case the deterministic heuristic would already have caught is evidence
+to lean NONE here, not re-confirm it. HEADING_PARENT has no such
+deterministic pre-filter for a Table/Image anchor (unlike a numbered Text
+subheading, which `nest_numbered_headings` already catches without a VLM) —
+it's judged on its own merits, but still defaults to NONE when unsure, since
+a wrong reparenting is worse than leaving the structure unchanged.
 
 edge_type:
-- CAPTION_OF: the Text directly describes/names this Table/Image (accepted
-  even without an explicit label like "Table 1"/"Figure 2", as long as it's
-  clear from the content that it points to this one table/figure)
-- REFERENCES: this Text references the Table/Image (dependent vs.
-  independent isn't distinguished)
-- NONE: no relationship (not included in the proposal)
+- CAPTION_OF: the Text directly describes/names this Table/Image with no
+  explicit label prefix ("표 "/"Table "/...) — that case is already handled
+  deterministically — but it's still unmistakably a caption for this one
+  table/figure and no other (a repeated title/generic name is not enough).
+- REFERENCES: the Text points at this exact Table/Image the way a paper's
+  inline "[1]" points at its bibliography entry — a specific, checkable
+  pointer, not a topical relationship. Only two kinds qualify: (a) it names
+  or quotes a value, identifier, or detail that appears in this anchor and
+  distinguishes it from any neighboring table/figure, or (b) it explicitly
+  says it's pointing at a table/figure ("as shown above", "see the photo
+  below") even without a numbered label. A shared subject, a nearby
+  sentence, or a table/figure that merely supports the same argument is
+  NOT a reference — the label-citation case ("Figure 1", "표1") is already
+  covered deterministically and must NOT be re-proposed here.
+- HEADING_PARENT: the candidate is the actual section/subsection heading
+  the anchor's content belongs under — see `promote_heading_parents`'s old
+  docstring criteria (a caption/label is never a heading; a body sentence
+  is never a heading). At most one candidate can hold this role per anchor.
+  Unlike the other two, this one isn't returned as a proposal — see below.
+- NONE: no relationship/role, or a case the deterministic heuristics
+  already cover. Choose NONE whenever unsure.
+
+**Two different trust levels inside one call, applied differently**:
+CAPTION_OF/REFERENCES are additive-only, so they're returned as *candidates*
+(`propose_edges`'s return value) — never written to `document.edges`
+directly, exactly as before. HEADING_PARENT is structural — it deletes the
+deterministically created `Artifact -> content` PARENT_OF edge and
+**reparents** it as `heading Text -> content` (deepening the tree by one
+level), the one point in this project where LLM involvement is opened up
+for PARENT_OF at all (an explicit opt-in exception to schema.py's "PARENT_OF
+is deterministic" principle) — so it's applied directly to `document` in
+place, with a cycle check (`_is_ancestor`) before every reparent, and left
+untouched whenever ambiguous (more than one, or zero, candidates picked) or
+the API call fails. A reparented anchor's new PARENT_OF edge carries
+`properties["reparented_from"]` (the old parent's id) so a caller can find
+every reparent `propose_edges` performed by scanning `document.edges` after
+the call, without a separate return value for it.
 
 This module can be imported without the `openai` package (an optional
 dependency), but it's required when `propose_edges` is actually called — so
@@ -43,23 +100,35 @@ worst failure mode is "removing a correct one," not "inventing one that
 doesn't exist," it modifies `document` directly in place) — see the
 function's own docstring.
 
-**`promote_heading_parents`**: the function that crosses the trust boundary
-furthest of the three. `PARENT_OF` as specified by `schema.py`
-("hierarchical parent-child, deterministic, File->Artifact->content") was
-the one edge type in this project with the principle of "no LLM proposal" —
-this function makes an **opt-in exception** to that principle: if a VLM
-judges that one of the Text candidates around a Table/Image is actually the
-title (heading) of the section that content belongs to, it removes the
-deterministically created `Artifact -> Table/Image` PARENT_OF edge and
-**reparents** it as `heading Text -> Table/Image` (deepening the tree by
-one level). Unlike `propose_edges` (additive only) and
-`resolve_ambiguous_captions` (removal only), this is an operation that
-"deletes a deterministic structural edge and reasserts a new one based on
-an LLM judgment," so the worst failure mode can be "reparenting the
-structure incorrectly" — hence it's an opt-in feature that should default
-to off, and it always leaves the original structure (Artifact as parent)
-untouched when ambiguous or the API fails. See the function's own
-docstring.
+**Heading-PARENT_OF for a Table/Image anchor** (formerly the separate
+`promote_heading_parents` function, folded into `propose_edges` on
+2026-09-12): `PARENT_OF` as specified by `schema.py` ("hierarchical
+parent-child, deterministic, File->Artifact->content") was the one edge
+type in this project with the principle of "no LLM proposal" —
+HEADING_PARENT makes an **opt-in exception** to that principle, reparenting
+`Artifact -> Table/Image` to `heading Text -> Table/Image` (see the
+"Two different trust levels" note above for the mechanics). Unlike
+CAPTION_OF/REFERENCES (additive only) and `resolve_ambiguous_captions`
+(removal only), this is an operation that "deletes a deterministic
+structural edge and reasserts a new one based on an LLM judgment," so the
+worst failure mode can be "reparenting the structure incorrectly" — hence
+it always leaves the original structure (Artifact as parent) untouched when
+ambiguous or the API call fails, the same conservatism the standalone
+function used to apply.
+
+**`propose_edges(..., include_text_anchors=True)`**: extends HEADING_PARENT
+judgment to Text anchors too (e.g. a subheading Text under its parent
+heading Text, a body paragraph under its section's heading) — this gets
+closer to a real document outline, but since Text can now be both parent
+and child, a cycle risk arises (e.g. A proposed as B's heading while B is
+simultaneously proposed as A's heading); `_is_ancestor` blocks any reparent
+that would create one. CAPTION_OF/REFERENCES are never judged for a Text
+anchor (a Text doesn't caption/reference another Text in this schema), so
+this runs as a separate batched pass rather than sharing the Table/Image
+anchor's one-call-per-anchor path — see "Batching and concurrency" below
+for why. Off by default (`include_text_anchors=False`) since the number of
+anchors grows from "one per Table/Image" to "one per paragraph," a much
+larger opt-in cost.
 
 **`merge_fragmented_text`**: PDF only (a no-op with no clusters caught at
 all on other format documents). `extractors/pdf._reorder_same_line_blocks`
@@ -101,7 +170,7 @@ relationship "these 8 are one group"). `schema.py`'s `Group` node
 proposes creating one — candidates (the list of siblings sharing the same
 parent) are built deterministically, and the actual judgment (requiring at
 least 2 independent cues among spatial/visual/structural/semantic/boundary
-signals) is left to the VLM. Like `promote_heading_parents`, it deletes and
+signals) is left to the VLM. Like HEADING_PARENT reparenting, it deletes and
 reasserts structural edges, but since what it creates is a **new Group
 node** rather than an existing one, there's no cycle risk (no `_is_ancestor`
 check needed). Runs in `apply_vlm_enrichment` for PPTX with attached slide images;
@@ -109,63 +178,134 @@ otherwise opt-in. See the function's own docstring.
 
 **Batching and concurrency** (2026-09-05, empirical basis in
 `docs/vlm-integration-research.md` §14): `merge_fragmented_text` and
-`promote_heading_parents` (especially with `include_text_anchors=True`)
-were built as one API call per judgment unit (cluster/anchor), which took
-753 seconds on a document with 250+ anchors — mostly a fixed per-request
-round-trip delay rather than judgment time. Now several items are judged in
-one batch inside a single structured-output call (`batch_size`, default
-25 — a tradeoff between reducing round trips and "Lost in the Middle"
-degradation), and batches run concurrently via a `ThreadPoolExecutor`
-(`max_workers`, default 8). The judgment itself is still independent per
-item, so there's no loss of safety — only the unit of failure grows from
-one item to one batch. Confirmed on re-measurement: 753s -> 98s (~7.7x),
-with no regression in merge/reparent result quality.
-`promote_heading_parents` keeps individual calls as the one exception, for
-anchors that have a pixel (to avoid the confusion of mixing several images
-into one batch).
+`propose_edges`'s Text-anchor HEADING_PARENT pass (`include_text_anchors=True`,
+one per paragraph) were built as one API call per judgment unit
+(cluster/anchor), which took 753 seconds on a document with 250+ anchors —
+mostly a fixed per-request round-trip delay rather than judgment time. Now
+several items are judged in one batch inside a single structured-output
+call (`batch_size`, default 25 — a tradeoff between reducing round trips
+and "Lost in the Middle" degradation), and batches run concurrently via a
+`ThreadPoolExecutor` (`max_workers`, default 8). The judgment itself is
+still independent per item, so there's no loss of safety — only the unit of
+failure grows from one item to one batch. Confirmed on re-measurement: 753s
+-> 98s (~7.7x), with no regression in merge/reparent result quality. The
+Text-anchor pass keeps individual calls as the one exception, for anchors
+that have a pixel (to avoid the confusion of mixing several images into one
+batch) — Table/Image anchors always go through individual calls regardless
+(they're the one-call-per-anchor path that also judges CAPTION_OF/
+REFERENCES, described above), so this batching only ever applies to
+`include_text_anchors=True`'s text-only paragraphs.
+
+**Enumerated-sibling collapsing** (inside `propose_edges`'s Text-anchor
+pass, not a separate function — see `_propose_text_heading_parents`'s
+docstring): `build_context_windows`'s `window` bounds each anchor's own
+candidate list to a handful of nearby Text nodes — enough for a typical
+anchor, but a section with more preceding body lines than the window holds
+can push its own heading out of a later sibling's candidate list entirely,
+and no layout image rescues this (the model can only pick an index from the
+candidates it was actually given). Confirmed on a real xlsx document: a
+flat "1) .../2) .../3) ..." list where "1)"'s own window reached the
+heading fine, but "3)"'s own window was exactly consumed by "1)", "2)", and
+a sub-bullet before ever reaching that same heading a few lines further up.
+Rather than asking the same underlying question once per member and hoping
+they agree (or patching a straggler up afterward), the enumeration's own
+numbering is used *before* any VLM call: a flat, consecutively-numbered run
+is collapsed into a **single** HEADING_PARENT question, asked using the
+run's first (and so heading-closest) member's own candidate window, with
+the answer applied to every member identically — never a disagreement to
+adjudicate, and never a later member's worse-positioned window in play at
+all.
+
+**Row-sibling window widening** (`_widen_row_sibling_windows`, inside
+`propose_edges`'s Table/Image pass): xlsx's spatial candidate ranking (see
+"Two different trust levels" above) means several Table/Image nodes
+anchored at the exact same row — a common pattern, several photos (or a
+small table) side by side illustrating one point — can each see a
+*different* HEADING_PARENT window purely because of which column they
+happen to sit in. Confirmed on a real xlsx document: 4 such photos, 3 of
+them had their section heading rank among their own nearest spatial
+neighbors, but the 4th — sharing its column with two unrelated nearby
+lines (a numbered item two bullets below, and its own elaboration) — had
+those two outrank the heading entirely, so it was silently left
+unreparented while its row-siblings resolved fine. Unlike the
+enumerated-sibling case above, CAPTION_OF/REFERENCES still needs judging
+per-anchor (each photo/table can show something different), so the
+anchors can't be collapsed into one question — instead, each anchor's own
+candidate list is widened with the union of its same-row siblings' own
+candidates (deduplicated): if the heading is close enough to be *any*
+sibling's neighbor, every sibling gets a fair shot at it. CAPTION_OF/
+REFERENCES eligibility (`caption_eligible_ids`) is computed before this widening and
+never touched by it, so a candidate borrowed only from a sibling's window
+still can't become *this* image's own caption/reference.
+
+**Caption/reference exclusion** (`_caption_or_reference_source_ids`,
+consumed by `_propose_text_heading_parents`'s `excluded_candidate_ids`): a
+Text already judged — deterministically (`caption_prefix_edges`/
+`reference_label_edges`, already in `document.edges`) or by this same
+call's own Table/Image pass (`proposals`, not yet applied) — to caption or
+reference a Table/Image is dropped from every *other* anchor's
+HEADING_PARENT candidate list before the Text-anchor pass ever calls the
+model. `_HEADING_INSTRUCTIONS` already says a caption/label "names one
+object, not a section," but that was only ever a prompt-level request, not
+mechanically enforced for a caption with no recognizable label prefix (so
+undetected by the deterministic heuristics) — confirmed on a real pptx
+document: a short image caption got picked as an unrelated Text's section
+heading purely because nothing had disqualified it as a candidate. Reusing
+this project's own CAPTION_OF/REFERENCES judgment (a narrower, more
+reliable question than the open-ended "is this a legitimate heading") is
+more robust than a new geometric caption-likeness heuristic (e.g. bbox
+overlap with a nearby Image) — no new per-format tuning, and it mechanically
+enforces a rule already declared rather than inventing one.
 
 **`nest_numbered_headings`**: needs no VLM/API, pure text pattern matching.
-`promote_heading_parents` only judges each content node individually for
-"is there a heading-looking text nearby that could be its parent," with no
-notion of the hierarchy rule that a numbered subheading ("3.1") should go
-under its section ("3") — confirmed (`1706.03762`): 11 of 13 numbered
-subheadings stayed directly under the Artifact with the VLM step alone.
+`propose_edges`'s HEADING_PARENT judgment only considers each content node
+individually for "is there a heading-looking text nearby that could be its
+parent," with no notion of the hierarchy rule that a numbered subheading
+("3.1") should go under its section ("3") — confirmed (`1706.03762`): 11 of
+13 numbered subheadings stayed directly under the Artifact with the VLM
+step alone.
 This function finds text in the form "N.M Title" and deterministically
 reparents it under its number's parent section. Since the parent is
 determined purely by the number (`"3.1"`'s parent is always `"3"`), this
-can never create a cycle structurally, so unlike `promote_heading_parents`
+can never create a cycle structurally, so unlike HEADING_PARENT reparenting
 it needs no separate cycle check. To keep a table data row ("1 512 512
 ...") from being mistaken for a heading just because it starts with a
 digit, only a number immediately followed by a letter counts as a heading
 (a counterexample confirmed empirically).
 
 **`apply_vlm_enrichment`**: a convenience function that runs
-`merge_semantic_text_groups` + `merge_fragmented_text` +
-`promote_heading_parents` + `nest_numbered_headings` + `propose_edges` all
-at once — used when a call site (the CLI's `--vlm-enrichment`, the demo app)
-just wants "use the VLM or not" as a single switch (`nest_numbered_headings`
-itself doesn't need a VLM, but it's always bundled in since it directly
-fills the subheading-hierarchy gap `promote_heading_parents` leaves). This
-doesn't erase the trust-level differences between the functions above
-(structural merge/reparent vs. additive only, VLM judgment vs.
-deterministic pattern) — it just reduces the repetition of calling them
-together, so call the original functions directly if you only need some of
-them. The order is `merge_semantic_text_groups` ->
-`merge_fragmented_text` -> `promote_heading_parents` ->
-`nest_numbered_headings` -> `propose_edges` — running the merges first is
+`merge_semantic_text_groups` + `merge_fragmented_text` + `propose_edges`
+(with `include_text_anchors`) + `nest_numbered_headings` all at once — used
+when a call site (the CLI's `--vlm-enrichment`, the demo app) just wants
+"use the VLM or not" as a single switch (`nest_numbered_headings` itself
+doesn't need a VLM, but it's always bundled in since it directly fills the
+hierarchical-subheading gap HEADING_PARENT reparenting leaves — the flat
+enumerated-sibling gap is instead closed inside `propose_edges` itself, see
+above). This doesn't erase the trust-level differences described above
+(structural merge/reparent vs. additive only, VLM judgment vs. deterministic
+pattern) — it just reduces the repetition of calling them together, so
+call the original functions directly if you only need some of them. The
+order is `merge_semantic_text_groups` -> `merge_fragmented_text` ->
+`propose_edges` -> `nest_numbered_headings` — running the merges first is
 because it's better for the Table/Image-surrounding context text the other
 functions see to be clean rather than fragmented, and putting
-`nest_numbered_headings` right after heading promotion is to definitively
-clean up the subheading relationships the VLM missed.
+`nest_numbered_headings` right after `propose_edges` is to definitively
+clean up the subheading relationships the VLM missed. CAPTION_OF/REFERENCES
+proposals from `propose_edges` still need an explicit
+`document.edges.extend(...)` after
+this call — HEADING_PARENT reparenting is already applied by the time
+`propose_edges` returns, but the additive proposals never mutate `document`
+on their own (same rule as calling `propose_edges` standalone).
 """
 from __future__ import annotations
 
+import logging
 import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, Sequence
 
 import openpyxl
 import pymupdf
@@ -178,10 +318,14 @@ from ..capture.xlsx_capture import capture_table_image
 from ..extractors.pdf import _y_overlap_frac
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
 from ._config import DEFAULT_MODEL
+from .trace import HeadingOutcome, ProposalRecord, SiblingGroups, TraceClient, parse_with_context, trace_session
+
+logger = logging.getLogger(__name__)
 
 CONTEXT_WINDOW = 3  # how many content nodes before/after the anchor to offer as candidates
 
-# Batching/concurrency defaults shared by `promote_heading_parents`/`merge_fragmented_text`.
+# Batching/concurrency defaults shared by `propose_edges`'s Text-anchor pass
+# (`_propose_text_heading_parents`) and `merge_fragmented_text`.
 # Confirmed (2026-09-05, `1706.03762`): calling 250+ anchors one by one,
 # sequentially, took 753 seconds — mostly a fixed per-request round-trip
 # delay (a latency floor) rather than the judgment itself. Several items are
@@ -205,7 +349,7 @@ def _chunked(items: list, size: int) -> list[list]:
 
 class _EdgeProposal(BaseModel):
     context_index: int = Field(description="Zero-based index of the node in the candidate list.")
-    edge_type: Literal["CAPTION_OF", "REFERENCES", "NONE"]
+    edge_type: Literal["CAPTION_OF", "REFERENCES", "HEADING_PARENT", "NONE"]
     rationale: str = Field(description="One concise sentence explaining the decision.")
 
 
@@ -214,11 +358,26 @@ class _EdgeProposalResult(BaseModel):
 
 
 _INSTRUCTIONS = """\
-You propose edges between nodes in a document graph. You receive one anchor
-node (Table or Image) and a list of nearby candidate nodes (all Text).
-Candidates have already been filtered for proximity, but proximity alone is
-not evidence of a relationship. Decide whether each candidate specifically
-describes or refers to this exact anchor.
+You judge three independent roles a candidate can have relative to one
+anchor: CAPTION_OF, REFERENCES, and HEADING_PARENT. For CAPTION_OF and
+REFERENCES, you are a corrective pass, not the primary classifier — a
+deterministic heuristic already resolves every case with an explicit marker
+(a caption starting with a table/figure label prefix, in Korean or English,
+e.g. "Table "/"Figure ", and any other text that cites that same label by
+name elsewhere, e.g. "Figure 1" or its Korean equivalent with no space
+before the number) before you ever see this document. You only run on what's
+left for those two roles: candidates with no such marker at all. Assume most
+of them are NONE. HEADING_PARENT has no such deterministic pre-filter for a
+Table/Image anchor — judge it on its own merits, but a wrong reparenting is
+still worse than leaving the structure unchanged, so prefer NONE there too
+when unsure.
+
+You receive one anchor node (Table or Image) and a list of nearby candidate
+nodes (all Text). Candidates have already been filtered for proximity, but
+proximity alone is not evidence of any of the three roles. Some candidates
+are marked "(too far for CAPTION_OF/REFERENCES)" — a nearer table/image sits
+between that candidate and the anchor, so it can still be HEADING_PARENT but
+must never be CAPTION_OF/REFERENCES.
 
 ## Repeated document structures
 Documents often repeat a pattern such as one table or photo followed by a
@@ -228,22 +387,43 @@ could fit, such as "measurement results," "specification table," or "sample
 photo." Require concrete correspondence in names, values, identifiers, or
 content that distinguishes this anchor from its neighbors.
 
-## Edge types
-- CAPTION_OF: The Text specifically names or describes this Table/Image. An
-  explicit label such as "Table 1" or "Figure 2" is not required, but the
-  candidate's concrete title, item names, values, or other details must match
-  the anchor's actual content.
-- REFERENCES: The Text explicitly refers to this anchor or relies on its
-  specific content, such as citing a value from it. Merely sharing a topic is
-  insufficient.
-- NONE: Neither relationship applies. When uncertain, choose NONE. Never infer
-  an edge from proximity alone.
+## Roles
+- CAPTION_OF: The Text specifically names or describes this Table/Image with
+  no explicit label prefix (a leading "Table "/"Figure "/... in either
+  language — those are already handled and must NOT be re-proposed here).
+  Its concrete title, item names, values, or other details must still
+  unmistakably match this anchor's actual content and no neighboring one.
+- REFERENCES: Treat this the way a paper's inline "[1]" points at its exact
+  bibliography entry, not the way one sentence relates to another by topic.
+  A citation of the numbered/lettered label itself (e.g. "Figure 1", in
+  either language) is already handled deterministically and must NOT be
+  re-proposed here. Assign REFERENCES only when, with no such label present,
+  the candidate still (a) names or quotes a specific value, identifier, or
+  detail that appears in this anchor and distinguishes it from any
+  neighboring table/figure, or (b) explicitly points at "the table/figure"
+  as an object ("as shown above", "see the photo below") even without a
+  number. Sharing a subject, discussing a related measurement, or
+  supporting the same argument is NOT a reference by itself — that is
+  exactly the "related, not referencing" looseness to avoid.
+- HEADING_PARENT: The candidate is the actual section or subsection heading
+  that this anchor's content belongs under, such as a short title like "3.
+  Measurement Results." Never a caption/label ("Table 1"/"Figure 2" names
+  one object, not a section), and never a body sentence merely above or
+  below the anchor — select it only when the anchor is genuinely content of
+  the section the candidate names. At most one candidate can be
+  HEADING_PARENT for a given anchor; if more than one plausibly qualifies,
+  or none clearly does, choose NONE for all of them rather than guessing.
+- NONE: None of the above, or the case is already covered by a
+  deterministic heuristic. When uncertain, choose NONE. Never infer any of
+  the three roles from proximity, shared topic, or narrative plausibility
+  alone.
 
 ## Requirements
 - Return one decision for every candidate, including NONE decisions.
 - Base decisions on the actual candidate text and any attached anchor/layout
-  images. For CAPTION_OF or REFERENCES, explain why the candidate points to
-  this anchor rather than a neighboring one.
+  images. Explain why the candidate has the role you chose (or came close
+  but didn't qualify), and for CAPTION_OF/REFERENCES, why it isn't already
+  covered by the deterministic label heuristic.
 - When an anchor image is attached, treat its pixels as the primary evidence;
   table-grid previews and names are only supporting context.
 """
@@ -584,10 +764,10 @@ def build_context_windows(
     Assumes `nodes` is already sorted in document order (NEXT order) —
     just use the order `ArticDocument.content_nodes()` produces as-is.
 
-    **Boundary (`boundary_types`, default Table/Image)**: while searching up
-    to `window` nodes in each direction from the anchor, if another node
-    belonging to `boundary_types` is encountered, the search in that
-    direction stops right there (that node itself isn't added as a
+    **Boundary (`boundary_types`, default Table/Image)**: while searching in
+    each direction from the anchor for up to `window` **Text** candidates,
+    if another node belonging to `boundary_types` is encountered, the search
+    in that direction stops right there (that node itself isn't added as a
     candidate either) — because Text beyond it is text that's "already
     closer to another table/image." Without this, in a document where
     tables/images sit closely packed (e.g. an engineering review document
@@ -597,10 +777,24 @@ def build_context_windows(
     leads to a caption getting wrongly linked to the neighboring table
     (confirmed: a CAPTION_OF/REFERENCES edge does get created, but "the edge
     connects the wrong pair of nodes"). Even when `TEXT` is included in
-    `anchor_types` (`promote_heading_parents`'s `include_text_anchors=True`),
-    `boundary_types` keeps its default (Table/Image) — heading search
-    shouldn't stop at every single body-paragraph Text, only at content like
-    a table/image that actually functions as a section boundary.
+    `anchor_types` (`propose_edges`'s Text-anchor HEADING_PARENT pass,
+    `include_text_anchors=True`), `boundary_types` keeps its default
+    (Table/Image) — heading search shouldn't stop at every single
+    body-paragraph Text, only at content like a table/image that actually
+    functions as a section boundary.
+
+    `window` counts **Text nodes actually added as candidates**, not nodes
+    scanned — a non-boundary, non-Text node (e.g. several Images in a row
+    illustrating the current paragraph) is skipped over for free rather than
+    eating into the budget. Confirmed on a real xlsx review document: a
+    numbered subsection ("3) ...") sitting right after 4 embedded photos had
+    zero Text within the old `window`-nodes-scanned reach in that direction,
+    so its actual section heading (further back, past the photos) was never
+    even offered as a HEADING_PARENT candidate — silently leaving it
+    unreparented, at the same level as its own heading instead of nested
+    under it, with 1)/2) (which had no photo gap before their heading)
+    reparenting correctly right next to it. A node this can't reach at all:
+    the anchor itself and the start/end of `nodes`.
     """
     windows = []
     for i, n in enumerate(nodes):
@@ -608,21 +802,25 @@ def build_context_windows(
             continue
 
         left: list[Node] = []
-        for j in range(i - 1, max(0, i - window) - 1, -1):
+        j = i - 1
+        while j >= 0 and len(left) < window:
             other = nodes[j]
             if other.type in boundary_types:
                 break
             if other.type == NodeType.TEXT:
                 left.append(other)
+            j -= 1
         left.reverse()  # restore document order (left -> right)
 
         right: list[Node] = []
-        for j in range(i + 1, min(len(nodes), i + window + 1)):
+        j = i + 1
+        while j < len(nodes) and len(right) < window:
             other = nodes[j]
             if other.type in boundary_types:
                 break
             if other.type == NodeType.TEXT:
                 right.append(other)
+            j += 1
 
         candidates = left + right
         if candidates:
@@ -684,8 +882,41 @@ def _build_document_context_windows(
     """PPTX considers every Text in the same slide, ranked by proximity.
     In-plot labels otherwise crowd out below-plot captions such as before/after.
     XLSX retains its bounded spatial window; other formats use document order.
+
+    PPTX Text anchors also use the full slide: on a two-column PBA review,
+    a page number and preceding section blocks exhausted the reading-order
+    window before the last two sections could reach their slide title.
+    Proximity orders candidates but cannot exclude that title.
+
+    The Text-anchor HEADING_PARENT pass (`anchor_types=(NodeType.TEXT,)`,
+    always called with `boundary_types=()`) is the exception for
+    XLSX: it reuses the plain reading-order scan (`build_context_windows`,
+    scoped to one sheet) instead of the spatial ranking below — see
+    that branch's own comment for why. A Table/Image anchor's own
+    HEADING_PARENT window (also `boundary_types=()`, judged together with
+    CAPTION_OF/REFERENCES in `_propose_for_anchor`) deliberately keeps the
+    spatial ranking instead — confirmed on a real xlsx document: switching
+    it to reading-order too let a spatially-distant, textually-distracting
+    line (itself quoting the document's own title) crowd out a table's
+    genuinely nearest, spatially-obvious heading, breaking a
+    Table→heading pairing that the spatial ranking already got right.
     """
     content = document.content_nodes()
+    if document.format in {"docx", "pdf"}:
+        # Cached TOC entries describe navigation, not nearby body sections.
+        content = [node for node in content if not node.properties.get("is_toc")]
+        native_children = {
+            edge.target_id for edge in document.edges
+            if edge.type == EdgeType.PARENT_OF
+            and edge.properties.get("structural_source") in {"docx_outline", "pdf_outline"}
+        }
+        windows = build_context_windows(
+            content, window=window, anchor_types=anchor_types, boundary_types=boundary_types
+        )
+        # Table/Image still need their caption/reference judgment. Their native
+        # parents are protected again at application time.
+        return [(anchor, candidates) for anchor, candidates in windows
+                if anchor.type != NodeType.TEXT or anchor.id not in native_children]
     if document.format not in ("xlsx", "pptx"):
         return build_context_windows(
             content, window=window, anchor_types=anchor_types, boundary_types=boundary_types
@@ -695,6 +926,37 @@ def _build_document_context_windows(
         return build_context_windows(
             content, window=window, anchor_types=anchor_types, boundary_types=boundary_types
         )
+    if document.format == "xlsx" and boundary_types == () and anchor_types == (NodeType.TEXT,):
+        # HEADING_PARENT wants "the nearest heading-like text when scanning
+        # outward in reading order, skipping past intervening non-boundary
+        # content for free" (see build_context_windows's docstring) — not
+        # "nearest in any direction by raw pixel/cell distance," which the
+        # spatial ranking below is tuned for instead (it was built for
+        # CAPTION_OF/REFERENCES, where the physically nearest text really is
+        # the best caption candidate, and works well enough for a
+        # Table/Image anchor's own HEADING_PARENT judgment too — see this
+        # function's docstring). Confirmed on a real xlsx document: a
+        # numbered subsection's own body text (a phenomenon/cause writeup
+        # right above it) ranked spatially closer than its actual section
+        # heading a few lines further up, so the heading never even made the
+        # top-`window` cut — while reading-order scanning finds it correctly
+        # once `build_context_windows` skips non-Text for free (see its
+        # docstring). Scoped to Text anchors only — see the module-level
+        # docstring for why a Table/Image anchor keeps the spatial ranking.
+        # Grouping preserves each sheet's row/column order and keeps
+        # candidates from leaking across sheets.
+        groups: dict[str, list[Node]] = {}
+        for node in content:
+            artifact_id = artifact_by_node.get(node.id)
+            if artifact_id is not None:
+                groups.setdefault(artifact_id, []).append(node)
+        return [
+            window_pair
+            for group_nodes in groups.values()
+            for window_pair in build_context_windows(
+                group_nodes, window=window, anchor_types=anchor_types, boundary_types=boundary_types
+            )
+        ]
     windows: list[tuple[Node, list[Node]]] = []
     for anchor in content:
         if anchor.type not in anchor_types:
@@ -724,17 +986,31 @@ def _propose_for_anchor(
     anchor: Node,
     candidates: list[Node],
     *,
+    caption_eligible_ids: set[str] | None = None,
     layout_crop_fn: Callable[[Node, list[Node]], bytes | None] | None = None,
-) -> list[Edge]:
+) -> tuple[list[Edge], tuple[int, str] | None]:
+    """Returns (CAPTION_OF/REFERENCES proposals, heading_choice). `candidates`
+    may reach further than a CAPTION_OF/REFERENCES candidate normally would
+    (see `propose_edges`'s wide/narrow window split) so HEADING_PARENT can
+    still see past a neighboring table/image — `caption_eligible_ids`
+    (candidate ids from the narrower, boundary-respecting window) marks
+    which of them stay eligible for CAPTION_OF/REFERENCES; `None` means no
+    narrowing (every candidate eligible, e.g. the xlsx/pptx spatial path
+    where this distinction doesn't apply). `heading_choice` is
+    (candidate_index, rationale) for the sole candidate marked
+    HEADING_PARENT, or None if zero or more than one were (ambiguous is
+    treated the same as none — see the module docstring)."""
     candidate_desc = "\n".join(
         f"[{i}] ({c.type.value}, {_node_layout_hint(c)}) {_node_preview(c)}"
+        + ("" if caption_eligible_ids is None or c.id in caption_eligible_ids else " (too far for CAPTION_OF/REFERENCES)")
         for i, c in enumerate(candidates)
     )
     prompt = (
         f"Anchor node ({anchor.type.value}, {_node_layout_hint(anchor)}): {_node_preview(anchor)}\n\n"
         f"Candidate nodes, ordered by layout proximity (the order itself is not evidence):\n"
         f"{candidate_desc}\n\n"
-        "Classify every candidate as CAPTION_OF, REFERENCES, or NONE. Choose NONE when uncertain."
+        "Classify every candidate's role as CAPTION_OF, REFERENCES, HEADING_PARENT, or NONE. "
+        "At most one candidate should be HEADING_PARENT. Choose NONE when uncertain."
     )
 
     # Attach each of the two kinds of image separately (when present) —
@@ -762,7 +1038,7 @@ def _propose_for_anchor(
 
     content: list[dict] | str = blocks if len(blocks) > 1 else prompt
 
-    response = client.responses.parse(
+    response = parse_with_context(client, [(anchor, candidates)],
         model=model,
         instructions=_INSTRUCTIONS,
         input=[{"role": "user", "content": content}],
@@ -770,12 +1046,18 @@ def _propose_for_anchor(
     )
     parsed = response.output_parsed
     if parsed is None:
-        return []
+        return [], None
     edges: list[Edge] = []
+    heading_picks: list[tuple[int, str]] = []
     for p in parsed.proposals:
-        if p.edge_type == "NONE" or p.context_index >= len(candidates):
+        if p.edge_type == "NONE" or not (0 <= p.context_index < len(candidates)):
+            continue
+        if p.edge_type == "HEADING_PARENT":
+            heading_picks.append((p.context_index, p.rationale))
             continue
         target = candidates[p.context_index]
+        if caption_eligible_ids is not None and target.id not in caption_eligible_ids:
+            continue  # defense in depth — the model was told this candidate is HEADING_PARENT-only
         edges.append(
             Edge(
                 type=EdgeType(p.edge_type),
@@ -784,70 +1066,256 @@ def _propose_for_anchor(
                 properties={"rationale": p.rationale, "proposed_by": f"llm:{model}"},
             )
         )
-    return edges
+    # More than one HEADING_PARENT pick is exactly as ambiguous as zero —
+    # a wrong reparenting is worse than none, so don't guess which to trust.
+    heading_choice = heading_picks[0] if len(heading_picks) == 1 else None
+    return edges, heading_choice
 
 
-def propose_edges(document: ArticDocument, client=None, model: str = DEFAULT_MODEL, window: int = CONTEXT_WINDOW) -> list[Edge]:
-    """Proposes CAPTION_OF/REFERENCES between each Table/Image anchor in
-    `document` and its surrounding Text.
+def _widen_row_sibling_windows(
+    document: ArticDocument, wide_windows: list[tuple[Node, list[Node]]]
+) -> list[tuple[Node, list[Node]]]:
+    """Several Table/Image nodes anchored at the exact same xlsx row (a
+    common real pattern — several photos, or a small summary table next to
+    a couple of photos, side by side illustrating one point) can each have
+    a genuinely different nearest-by-distance HEADING_PARENT candidate set,
+    purely because of which *column* they happen to sit in: confirmed on a
+    real document, 4 photos at the same row illustrating one bullet — 3 of
+    them (in columns further from a numbered item two bullets below) had
+    their section heading rank in their own top-`window` spatial neighbors,
+    but the 4th (which happened to share that other item's column) had two
+    irrelevant nearby lines outrank the heading entirely, so it was
+    silently left unreparented while its 3 row-siblings resolved fine.
+    (Only confirmed for Image so far; Table is included on the same
+    reasoning — this project already treats Table/Image as one class of
+    anchor everywhere else — but revisit if a real Table row-sibling case
+    ever turns out to need something different.)
 
-    Doesn't modify `document.edges` directly — returns only the new list of
-    edges, and it's up to the caller whether to adopt them via
-    `document.edges.extend(...)` after human review (the principle that
-    every LLM-proposed edge in this schema is "a proposal, not final," see
-    schema.py).
+    Fix: an anchor's HEADING_PARENT candidates are widened with the union
+    of its same-row siblings' own candidates (deduplicated) — if the
+    heading is close enough to be *any* sibling's neighbor, every sibling
+    gets a fair shot at it, not just whichever one happens to sit in the
+    same column. CAPTION_OF/REFERENCES eligibility is untouched by this —
+    it's computed separately (`narrow_ids_by_anchor`, before this
+    widening), so a candidate borrowed only from a sibling's window can
+    still supply HEADING_PARENT but is correctly still ineligible as
+    *this* anchor's own caption/reference.
+
+    An anchor with no row-sibling (the overwhelming majority) is returned
+    unchanged — this only ever adds candidates, and only within a group of
+    2+ same-row Table/Image nodes in the same Artifact. Deliberately not
+    generalized further (e.g. to PPTX shapes at the same visual position)
+    without a confirmed real case — `row` is an xlsx-only property.
+    """
+    artifact_by_node = _content_artifact_map(document)
+    candidates_by_id = {anchor.id: candidates for anchor, candidates in wide_windows}
+    group_ids_by_key: dict[tuple[str | None, int], list[str]] = {}
+    for anchor, _ in wide_windows:
+        row = anchor.properties.get("row")
+        if anchor.type not in _DEFAULT_ANCHOR_TYPES or row is None:
+            continue
+        key = (artifact_by_node.get(anchor.id), row)
+        group_ids_by_key.setdefault(key, []).append(anchor.id)
+
+    widened: list[tuple[Node, list[Node]]] = []
+    for anchor, candidates in wide_windows:
+        row = anchor.properties.get("row")
+        eligible = anchor.type in _DEFAULT_ANCHOR_TYPES and row is not None
+        group_ids = group_ids_by_key.get((artifact_by_node.get(anchor.id), row), []) if eligible else []
+        if len(group_ids) < 2:
+            widened.append((anchor, candidates))
+            continue
+        merged = list(candidates)
+        seen_ids = {c.id for c in candidates}
+        seen_ids.add(anchor.id)
+        for sibling_id in group_ids:
+            if sibling_id == anchor.id:
+                continue
+            for c in candidates_by_id.get(sibling_id, []):
+                if c.id not in seen_ids:
+                    seen_ids.add(c.id)
+                    merged.append(c)
+        widened.append((anchor, merged))
+    return widened
+
+
+def _caption_or_reference_source_ids(document: ArticDocument, extra_edges: Sequence[Edge] = ()) -> set[str]:
+    """Every node id that is the *source* of a CAPTION_OF/REFERENCES edge —
+    either already in `document.edges` (deterministic, from
+    `scaffold.caption_prefix_edges`/`reference_label_edges`, or an earlier
+    `resolve_ambiguous_captions`/`propose_edges` call) or freshly proposed
+    in `extra_edges` (this same `propose_edges` call's own Table/Image
+    pass, not yet applied to `document`).
+
+    Used to keep a Text that's already judged to specifically caption or
+    reference a Table/Image from also being offered as some *other*
+    anchor's HEADING_PARENT candidate — `_HEADING_INSTRUCTIONS` already
+    says a caption/label "names one object, not a section," but that was
+    only ever a prompt-level request; nothing stopped a caption text with
+    no recognizable label prefix (so undetected by the deterministic
+    heuristics, and not yet resolved by this pass either) from still
+    reaching the candidate list and getting picked — confirmed on a real
+    pptx document: a short caption sitting right under an unrelated photo
+    got picked as an unrelated Text's section heading, purely because nothing
+    had disqualified it as a candidate. Reusing this project's own
+    CAPTION_OF/REFERENCES judgment (a narrower, more reliable question —
+    "does this Text specifically caption this Table/Image" — than the
+    open-ended "is this Text a legitimate section heading") is more robust
+    than adding a new geometric caption-likeness heuristic (e.g. bbox
+    overlap with a nearby Image): it needs no new per-format tuning, and it
+    mechanically enforces a rule the prompt already declares, rather than
+    inventing a new one."""
+    ids = {
+        e.source_id for e in document.edges
+        if e.type in (EdgeType.CAPTION_OF, EdgeType.REFERENCES)
+    }
+    ids.update(
+        e.source_id for e in extra_edges
+        if e.type in (EdgeType.CAPTION_OF, EdgeType.REFERENCES)
+    )
+    return ids
+
+
+def propose_edges(
+    document: ArticDocument,
+    client=None,
+    model: str = DEFAULT_MODEL,
+    window: int = CONTEXT_WINDOW,
+    include_text_anchors: bool = False,
+    *,
+    batch_size: int = _BATCH_SIZE,
+    max_workers: int = _DEFAULT_MAX_WORKERS,
+    trace_dir: str | Path | None = None,
+) -> list[Edge]:
+    """For each Table/Image anchor in `document`, judges CAPTION_OF,
+    REFERENCES, and HEADING_PARENT against its surrounding Text in **one
+    VLM call per anchor** — see the module docstring's "Two different trust
+    levels inside one call" for why these three are judged together and
+    applied differently.
+
+    **CAPTION_OF/REFERENCES**: doesn't modify `document.edges` directly —
+    returned in this function's result list, and it's up to the caller
+    whether to adopt them via `document.edges.extend(...)` after human
+    review (the principle that every LLM-proposed edge in this schema is "a
+    proposal, not final," see schema.py).
+
+    **HEADING_PARENT**: applied directly to `document.edges` (deletes the
+    `Artifact -> content` PARENT_OF edge, reparents it under the chosen
+    heading Text), guarded by a cycle check (`_is_ancestor`) — an anchor
+    left unreparented (no clear heading, an ambiguous multi-pick, or an API
+    failure) keeps its original structure untouched. A reparented anchor's
+    new PARENT_OF edge carries `properties["reparented_from"]`, so scan
+    `document.edges` for that key after the call to find every reparent this
+    made — it isn't part of this function's return value.
+
+    `include_text_anchors=True` additionally judges HEADING_PARENT for Text
+    anchors (a paragraph reparented under its own section heading) — off by
+    default since the anchor count grows from "one per Table/Image" to "one
+    per paragraph." CAPTION_OF/REFERENCES are never judged for a Text
+    anchor, so this runs as its own batched pass (`batch_size`/`max_workers`
+    — see the module docstring's "Batching and concurrency"), not merged
+    into the one-call-per-anchor path above.
 
     If `client` isn't given, `openai.OpenAI()` is built with its default
     constructor (needs the `OPENAI_API_KEY` environment variable) — this is
     why the `openai` package is an optional dependency.
 
-    If the API call for one anchor fails (a rate limit/timeout/transient
-    network error, etc.), only that anchor is skipped and the proposals for
-    the rest of the anchors are still returned — the same partial-failure
-    principle as the other LLM batch code (`caption_images.py`,
-    `table_structure.py`).
+    If the API call for one anchor (or one batch, for a batched Text anchor)
+    fails (a rate limit/timeout/transient network error, etc.), only that
+    anchor/batch is skipped and the rest are still processed — the same
+    partial-failure principle as the other LLM batch code
+    (`caption_images.py`, `table_structure.py`).
+
+    `trace_dir` optionally saves actual requests/images, candidate ID mappings,
+    parsed responses/errors, application reasons and graph snapshots in a
+    unique local run directory. It records document content, not credentials.
 
     If `document` is a PDF or XLSX extraction result, the original file is
-    opened once (`_build_layout_crop_renderer`) and reused across anchors —
-    reopening it for every anchor would be wasteful, and for any other
-    format, or if the original is lost, this automatically becomes a no-op
-    renderer, silently falling back to the text/isolated-crop path with no
-    layout crop (see `_propose_for_anchor`).
+    opened once (`_build_layout_crop_renderer`) and reused across every
+    anchor in both passes — reopening it per anchor would be wasteful, and
+    for any other format, or if the original is lost, this automatically
+    becomes a no-op renderer, silently falling back to the text/isolated-crop
+    path with no layout crop (see `_propose_for_anchor`).
     """
     if client is None:
         from openai import OpenAI  # lazy import — openai isn't needed unless this function is called
 
         client = OpenAI()
 
-    windows = _build_document_context_windows(
-        document,
-        window=window,
-        anchor_types=_DEFAULT_ANCHOR_TYPES,
-        boundary_types=_DEFAULT_ANCHOR_TYPES,
+    if trace_dir is not None:
+        with trace_session(client, trace_dir, document) as traced:
+            return propose_edges(document, client=traced, model=model, window=window,
+                                 include_text_anchors=include_text_anchors,
+                                 batch_size=batch_size, max_workers=max_workers)
+    if isinstance(client, TraceClient):
+        client.save("relations-before.json", document)
+
+    # Table/Image anchors: the wide window (no boundary) is what
+    # HEADING_PARENT needs to see past a neighboring table/image to find the
+    # real section heading; `narrow_ids_by_anchor` marks which of those
+    # candidates are still close enough (boundary-respecting) to be eligible
+    # for CAPTION_OF/REFERENCES — see `_propose_for_anchor`'s docstring. For
+    # xlsx/pptx, `_build_document_context_windows`'s spatial path ignores
+    # `boundary_types` entirely, so both windows come out identical there
+    # (no behavior change for those formats).
+    wide_windows = _build_document_context_windows(
+        document, window=window, anchor_types=_DEFAULT_ANCHOR_TYPES, boundary_types=()
     )
+    narrow_ids_by_anchor = {
+        a.id: {c.id for c in cands}
+        for a, cands in _build_document_context_windows(
+            document, window=window, anchor_types=_DEFAULT_ANCHOR_TYPES, boundary_types=_DEFAULT_ANCHOR_TYPES
+        )
+    }
+    wide_windows = _widen_row_sibling_windows(document, wide_windows)
+
+    proposals: list[Edge] = []
+    heading_reparents: list[tuple[Node, Node, str]] = []  # (anchor, new heading parent, rationale)
+
     layout_crop_fn, close_layout_resources = _build_layout_crop_renderer(document)
     try:
-        proposals: list[Edge] = []
-        for anchor, candidates in windows:
+        for anchor, candidates in wide_windows:
             try:
-                proposals.extend(
-                    _propose_for_anchor(client, model, anchor, candidates, layout_crop_fn=layout_crop_fn)
+                edges, heading_choice = _propose_for_anchor(
+                    client, model, anchor, candidates,
+                    caption_eligible_ids=narrow_ids_by_anchor.get(anchor.id, set()),
+                    layout_crop_fn=layout_crop_fn,
                 )
             except Exception:  # noqa: BLE001 — e.g. an API error, skip just this anchor and continue with the rest
                 continue
-        return proposals
+            proposals.extend(edges)
+            if heading_choice is not None:
+                index, rationale = heading_choice
+                heading_reparents.append((anchor, candidates[index], rationale))
+
+        if include_text_anchors:
+            heading_reparents.extend(
+                _propose_text_heading_parents(
+                    document, client, model, window,
+                    layout_crop_fn=layout_crop_fn,
+                    batch_size=batch_size, max_workers=max_workers,
+                    excluded_candidate_ids=_caption_or_reference_source_ids(document, proposals),
+                )
+            )
     finally:
         close_layout_resources()
 
+    _apply_heading_reparents(document, model, heading_reparents, trace=client if isinstance(client, TraceClient) else None)
+    if isinstance(client, TraceClient):
+        client.save("relations-after.json", document)
+        client.save("relation-proposals.json", ProposalRecord(proposals=proposals))
+    return proposals
+
 
 # ---------------------------------------------------------------------------
-# Reparenting PARENT_OF from heading Text -> Table/Image (deepening the
-# tree) — an opt-in exception to the principle schema.py nails down that
-# "PARENT_OF is deterministic." See the module docstring's
-# "promote_heading_parents" paragraph.
+# Reparenting PARENT_OF from heading Text -> content (deepening the tree) —
+# an opt-in exception to the principle schema.py nails down that "PARENT_OF
+# is deterministic." See the module docstring's "Two different trust levels
+# inside one call" and "propose_edges(..., include_text_anchors=True)"
+# paragraphs. The Table/Image half of this lives in `_propose_for_anchor`
+# above (one call together with CAPTION_OF/REFERENCES); everything below is
+# the Text-anchor extension plus the shared apply/cycle-check machinery.
 # ---------------------------------------------------------------------------
-
-HEADING_MODEL = DEFAULT_MODEL
 
 
 class _HeadingParentChoice(BaseModel):
@@ -867,15 +1335,30 @@ class _HeadingParentBatchResult(BaseModel):
 
 _HEADING_INSTRUCTIONS = """\
 Determine which section heading owns a content node in a document graph. You
-receive one anchor node (Table, Image, or Text) and nearby candidate nodes
-(all Text).
+receive one anchor node (a Text paragraph — a Table/Image anchor's heading is
+judged elsewhere, alongside its CAPTION_OF/REFERENCES) and nearby candidate
+nodes (all Text).
 
 ## Decision criteria
-- Select a candidate only when it is the actual section or subsection heading
-  for the anchor, such as a short title like "3. Measurement Results."
-- When the anchor is Text: if it is a subsection heading, find its parent
-  section heading; if it is a body paragraph, find the heading of its section.
-  The anchor itself is never included in the candidates.
+- Select a candidate only when it names the enclosing semantic unit that
+  owns the anchor. Titles and section/subsection headings are all eligible.
+- If the anchor is itself a subsection heading, find its parent section
+  heading; if it is a body paragraph, find the heading of its section. The
+  anchor itself is never included in the candidates.
+- Choose the nearest enclosing level in the semantic hierarchy, not simply
+  the nearest text in space. A title governing the whole content region is
+  an eligible parent of its top-level sections; its broad scope does not
+  disqualify it. Physical containers and semantic headings are distinct.
+  When no intermediate heading exists, a top-level section belongs directly
+  to the overall title that governs it. Do not require an extra section
+  heading between them or reject that title as "document-level."
+- Judge ownership of the entire anchor block. When a block contains both a
+  heading and its body, seek the parent of that section, not a heading for
+  a sentence inside it. Distinguish peer sections from their shared parent
+  using meaning and layout together.
+- Navigation, running metadata, and decorative elements are not section
+  content. Shared position, formatting, or markers alone do not establish
+  a parent-child relationship.
 - Never select the following as headings:
   - Captions or labels such as "Table 1" or "Figure 2." They name one object,
     not a section.
@@ -894,7 +1377,8 @@ def _propose_heading_parent(
     client, model: str, anchor: Node, candidates: list[Node], *, layout_png: bytes | None = None
 ) -> tuple[int, str] | None:
     """The index+rationale of whichever `candidates` (all Text) is the
-    heading for `anchor` (Table/Image/Text), or None if there isn't one.
+    heading for `anchor` (always Text here — a Table/Image anchor's heading
+    is judged by `_propose_for_anchor` instead), or None if there isn't one.
     Same pixel-attachment convention as `_propose_for_anchor`."""
     candidate_desc = "\n".join(
         f"[{i}] ({_node_layout_hint(c)}) {_node_preview(c)}" for i, c in enumerate(candidates)
@@ -918,14 +1402,18 @@ def _propose_heading_parent(
         blocks.append({"type": "input_image", "image_url": encode_png_bytes_data_url(layout_png), "detail": "high"})
     content: list[dict] | str = blocks if len(blocks) > 1 else prompt
 
-    response = client.responses.parse(
+    response = parse_with_context(client, [(anchor, candidates)],
         model=model,
         instructions=_HEADING_INSTRUCTIONS,
         input=[{"role": "user", "content": content}],
         text_format=_HeadingParentChoice,
     )
     parsed = response.output_parsed
-    if parsed is None or parsed.parent_index is None or not (0 <= parsed.parent_index < len(candidates)):
+    if parsed is None:
+        logger.warning("Heading judgment returned no parsed output for %s", anchor.id)
+        return None
+    logger.debug("Heading judgment for %s: parent_index=%s; %s", anchor.id, parsed.parent_index, parsed.rationale)
+    if parsed.parent_index is None or not (0 <= parsed.parent_index < len(candidates)):
         return None
     return parsed.parent_index, parsed.rationale
 
@@ -959,7 +1447,7 @@ def _propose_heading_parents_batch(
         "index of its section heading, or null if none. Set anchor_index to the corresponding anchor.\n\n"
         + "\n\n".join(blocks)
     )
-    response = client.responses.parse(
+    response = parse_with_context(client, items,
         model=model,
         instructions=_HEADING_INSTRUCTIONS,
         input=[{"role": "user", "content": prompt}],
@@ -980,7 +1468,7 @@ def _is_ancestor(edges: list[Edge], candidate_ancestor_id: str, node_id: str) ->
     """Whether `candidate_ancestor_id` is an ancestor of `node_id` (based on
     the current PARENT_OF edges).
 
-    `promote_heading_parents` calls this before linking `new_parent ->
+    `_apply_heading_reparents` calls this before linking `new_parent ->
     anchor` — if `anchor` is already an ancestor of `new_parent`, adding
     that edge would create a cycle the moment it's added, so it has to be
     blocked. Now that Text can become the parent of another Text (`TEXT`
@@ -998,48 +1486,35 @@ def _is_ancestor(edges: list[Edge], candidate_ancestor_id: str, node_id: str) ->
         cur = parent
 
 
-def promote_heading_parents(
+def _propose_text_heading_parents(
     document: ArticDocument,
-    client=None,
-    model: str = HEADING_MODEL,
-    window: int = CONTEXT_WINDOW,
-    include_text_anchors: bool = False,
+    client,
+    model: str,
+    window: int,
     *,
-    batch_size: int = _BATCH_SIZE,
-    max_workers: int = _DEFAULT_MAX_WORKERS,
-) -> list[str]:
-    """For a Table/Image content node (and Text too, if
-    `include_text_anchors=True`), if a VLM judges that a nearby Text
-    candidate is actually the title (heading) of the section that content
-    belongs to, **reparents** `PARENT_OF` from `Artifact -> content` to
-    `heading Text -> content` (deepening the tree by one level) — modifies
-    `document` in place.
+    layout_crop_fn: Callable[[Node, list[Node]], bytes | None],
+    batch_size: int,
+    max_workers: int,
+    excluded_candidate_ids: set[str] = frozenset(),
+) -> list[tuple[Node, Node, str]]:
+    """The `propose_edges(..., include_text_anchors=True)` extension: for
+    every Text content node, judges whether a nearby Text candidate is
+    actually the title (heading) of the section it belongs to. Returns
+    (anchor, heading, rationale) tuples for `_apply_heading_reparents` to
+    apply — doesn't touch `document` itself, so a caller inspecting
+    `propose_edges`'s CAPTION_OF/REFERENCES-only side effects mid-call never
+    sees a half-applied reparent.
 
-    **A different trust level**: unlike `propose_edges` (additive only) or
-    `resolve_ambiguous_captions` (removal only), this function deletes a
-    deterministically created structural edge (`Artifact -> content`
-    PARENT_OF) and creates a new PARENT_OF based on an LLM judgment — this
-    is the one point in this project where LLM involvement is opened up for
-    PARENT_OF at all (an explicit opt-in exception to schema.py's "PARENT_OF
-    is deterministic" principle). So it isn't wired into the default
-    workflow, and only runs when the caller calls it explicitly.
-
-    **`include_text_anchors=False` (default)**: only Table/Image gets
-    reparented under a heading. Text is always on the parent (heading) side
-    and never becomes a child (a reparent target), so a cycle can never
-    arise structurally.
-
-    **`include_text_anchors=True`**: a paragraph Text becomes a reparent
-    target too (e.g. a subheading Text under its parent heading Text, a body
-    paragraph under its section's heading) — this gets closer to a real
-    document outline, but since Text can now be both parent and child, a
-    cycle risk arises (e.g. A proposed as B's heading while B is
-    simultaneously proposed as A's heading). So before each reparent,
-    `_is_ancestor` checks whether it would create a cycle, and a reparent
-    that would is skipped (keeping the original structure). The number of
-    target nodes is much larger than Table/Image, so the number of anchors
-    grows accordingly (hundreds of Text in a document means hundreds of
-    anchors) — the batching/concurrency handling below cuts that cost.
+    A paragraph Text becomes a reparent target too here (e.g. a subheading
+    Text under its parent heading Text, a body paragraph under its
+    section's heading) — this gets closer to a real document outline, but
+    since Text can now be both parent and child, a cycle risk arises (e.g.
+    A proposed as B's heading while B is simultaneously proposed as A's
+    heading); `_apply_heading_reparents`'s `_is_ancestor` check blocks any
+    reparent that would create one. The number of anchors is much larger
+    than Table/Image (hundreds of Text in a document means hundreds of
+    anchors), which is exactly why this is a separate, batched pass rather
+    than folded into `_propose_for_anchor`'s one-call-per-anchor path.
 
     **Batching and concurrency** (2026-09-05, empirical basis in
     `docs/vlm-integration-research.md` §14): calling one API request per
@@ -1053,54 +1528,79 @@ def promote_heading_parents(
     concurrently, up to `max_workers`, via a thread pool (the openai client
     is thread-safe). The judgment itself still comes out independently per
     anchor, so there's no loss of safety — only the unit of failure grows
-    from one anchor to one batch (see the safeguards below). Actually
-    applying the reparents happens sequentially, in original document
-    order, after every response has come back (since the cycle check
-    depends on order).
+    from one anchor to one batch. Confirmed on re-measurement: 753s -> 98s
+    (~7.7x), with no regression in reparent result quality.
 
     Safeguards: if the candidate list is judged to have no real heading
-    (`parent_index=null`), the content node's existing PARENT_OF parent
-    can't be found, the reparent would create a cycle, or the API call
-    fails (the whole batch, for a batched call) — in every case the
-    original structure (Artifact or the existing parent, unchanged) is left
-    as-is and the item is skipped (the partial-failure principle, the same
-    one `propose_edges` follows, applied at the batch level).
+    (`parent_index=null`), or the API call fails (the whole batch, for a
+    batched call) — the item is simply left out of the returned list (the
+    partial-failure principle, applied at the batch level; `NONE`-worthy
+    ambiguity is `_apply_heading_reparents`'s job to catch for the ones that
+    are returned).
 
-    Returns: the list of content node ids that were actually reparented (for
-    logging/verification).
+    **Enumerated-sibling collapsing**: a flat "1) .../2) .../3) ..." run
+    (`_enumerated_sibling_groups`) is asked about **once**, not once per
+    member — the numbering already proves every member shares one parent,
+    so N independent questions about the same underlying answer only add a
+    chance they disagree, or that a later member's own candidate window
+    (starting further from the heading than an earlier member's) misses the
+    heading entirely even though an earlier member's window would have
+    found it (confirmed on a real xlsx document: "1)"/"2)" resolved
+    correctly, but "3)"'s own window was exactly consumed by "1)", "2)",
+    and a sub-bullet before ever reaching their shared heading a few lines
+    further up). The run's first (and so heading-closest) member stands in
+    for the whole group — its own window is used for the one decision, and
+    the result is applied to every member identically. A run whose own
+    first member has no candidate window at all (rare) isn't collapsed;
+    each member then falls back to being judged independently as if there
+    were no run.
+
+    **Caption/reference exclusion** (`excluded_candidate_ids`, from
+    `_caption_or_reference_source_ids` — see that function's docstring): a
+    Text already judged to specifically caption or reference a Table/Image
+    is dropped from every *other* anchor's candidate list before this ever
+    calls the model — `_HEADING_INSTRUCTIONS` already says a caption/label
+    "names one object, not a section," so this only mechanically enforces
+    a rule already declared, for the cases (no recognizable label prefix)
+    the deterministic heuristics can't catch on their own. An excluded
+    Text can still be an anchor itself (it belongs under some heading too),
+    it just stops being offered as *someone else's*.
     """
-    if client is None:
-        from openai import OpenAI  # lazy import — openai isn't needed unless this function is called
-
-        client = OpenAI()
-
-    anchor_types = (*_DEFAULT_ANCHOR_TYPES, NodeType.TEXT) if include_text_anchors else _DEFAULT_ANCHOR_TYPES
-    # boundary_types=() — unlike propose_edges, this doesn't stop at a
-    # boundary: it's normal for a section to have several tables/images
-    # (e.g. "3. Measurement Results" comes with one table and one photo) so
-    # cutting off heading search for a body Text just because it hit another
-    # Table/Image along the way would make it miss its actual heading. The
-    # problem of a caption leaking to the neighboring table when
-    # tables/images sit close together (see build_context_windows's default
-    # boundary_types) is specific to propose_edges (anchor=Table/Image,
-    # candidate=Text) and doesn't apply here.
+    # boundary_types=() — unlike the Table/Image narrow window, this doesn't
+    # stop at a boundary: it's normal for a section to have several
+    # tables/images (e.g. "3. Measurement Results" comes with one table and
+    # one photo) so cutting off heading search for a body Text just because
+    # it hit another Table/Image along the way would make it miss its
+    # actual heading. The problem of a caption leaking to the neighboring
+    # table when tables/images sit close together (see
+    # build_context_windows's default boundary_types) is specific to a
+    # Table/Image anchor's CAPTION_OF/REFERENCES and doesn't apply here.
     windows = _build_document_context_windows(
-        document, window=window, anchor_types=anchor_types, boundary_types=()
+        document, window=window, anchor_types=(NodeType.TEXT,), boundary_types=()
     )
-
-    # A PDF document and an openpyxl Workbook aren't guaranteed thread-safe,
-    # so layout rendering is finished sequentially before the API thread pool.
-    if document.format in ("xlsx", "pptx"):
-        layout_crop_fn, close_layout_resources = _build_layout_crop_renderer(document)
-    else:
-        layout_crop_fn, close_layout_resources = (lambda anchor, candidates: None), (lambda: None)
-    try:
-        visual_windows = [
-            (anchor, candidates, layout_crop_fn(anchor, candidates))
+    if excluded_candidate_ids:
+        windows = [
+            (anchor, [c for c in candidates if c.id not in excluded_candidate_ids])
             for anchor, candidates in windows
         ]
-    finally:
-        close_layout_resources()
+        windows = [(anchor, candidates) for anchor, candidates in windows if candidates]
+
+    window_by_anchor_id = {anchor.id: candidates for anchor, candidates in windows}
+    group_by_representative_id: dict[str, list[Node]] = {}
+    collapsed_ids: set[str] = set()
+    for group in _enumerated_sibling_groups(document):
+        representative, *rest = group
+        if representative.id not in window_by_anchor_id:
+            continue  # the heading-closest member has no candidates of its own — fall back to per-member judgment
+        group_by_representative_id[representative.id] = group
+        collapsed_ids.update(m.id for m in rest)
+    windows = [(anchor, candidates) for anchor, candidates in windows if anchor.id not in collapsed_ids]
+    if isinstance(client, TraceClient):
+        client.save("heading-groups.json", SiblingGroups(groups=[
+            [node.id for node in group] for group in group_by_representative_id.values()
+        ]))
+
+    visual_windows = [(anchor, candidates, layout_crop_fn(anchor, candidates)) for anchor, candidates in windows]
 
     def _has_isolated_pixel(anchor: Node) -> bool:
         path = _anchor_pixel_path(anchor)
@@ -1120,14 +1620,16 @@ def promote_heading_parents(
             choice = _propose_heading_parent(
                 client, model, anchor, candidates, layout_png=layout_png
             )
-        except Exception:  # noqa: BLE001 — e.g. an API error, leave this anchor's original structure as-is
+        except Exception as exc:  # noqa: BLE001 — leave this anchor's original structure as-is
+            logger.warning("Heading judgment failed for %s (%s)", anchor.id, type(exc).__name__)
             return {}
         return {anchor.id: choice} if choice is not None else {}
 
     def _fetch_batch(batch: list[tuple[Node, list[Node]]]) -> dict[str, tuple[int, str]]:
         try:
             choices = _propose_heading_parents_batch(client, model, batch)
-        except Exception:  # noqa: BLE001 — the whole batch failed, leave every anchor in this batch's original structure as-is
+        except Exception as exc:  # noqa: BLE001 — preserve every anchor in the failed batch
+            logger.warning("Heading judgment failed for batch of %d anchors (%s)", len(batch), type(exc).__name__)
             return {}
         result: dict[str, tuple[int, str]] = {}
         for choice in choices:
@@ -1149,21 +1651,60 @@ def promote_heading_parents(
         for future in as_completed(futures):
             choice_by_anchor_id.update(future.result())
 
-    promoted: list[str] = []
-    for anchor, candidates in windows:  # applied sequentially in original document order — the cycle check depends on order
+    reparents: list[tuple[Node, Node, str]] = []
+    for anchor, candidates in windows:  # kept in original document order — the cycle check applying these depends on order
         choice = choice_by_anchor_id.get(anchor.id)
         if choice is None:
             continue
         index, rationale = choice
         heading = candidates[index]
+        for target in group_by_representative_id.get(anchor.id, [anchor]):
+            reparents.append((target, heading, rationale))
+    return reparents
 
+
+def _apply_heading_reparents(document: ArticDocument, model: str, reparents: list[tuple[Node, Node, str]], *, trace: TraceClient | None = None) -> list[str]:
+    """Applies (anchor, new heading parent, rationale) reparents to
+    `document.edges` in place, in the order given (both `propose_edges`'s
+    Table/Image pass and `_propose_text_heading_parents` build their lists
+    in original document order — the cycle check below depends on that).
+
+    Safeguards: if the anchor's existing PARENT_OF parent can't be found
+    (should exist structurally, but may already have been reparented by an
+    earlier item in this same list) or the reparent would create a cycle
+    (`_is_ancestor`) — the original structure is left as-is and the item is
+    skipped (the same partial-failure principle as the rest of this
+    module).
+
+    Returns the ids of anchors actually reparented (for logging/
+    verification) — every one of them also carries
+    `properties["reparented_from"]` on its new PARENT_OF edge, which is how
+    `propose_edges`'s own docstring tells a caller to find these without a
+    dedicated return value there.
+    """
+    artifact_by_node = _content_artifact_map(document)
+    promoted: list[str] = []
+    for index, (anchor, heading, rationale) in enumerate(reparents):
         old_edge = next(
             (e for e in document.edges if e.type == EdgeType.PARENT_OF and e.target_id == anchor.id), None
         )
+        outcome = "applied"
         if old_edge is None:
-            continue  # should exist structurally but doesn't — skip safely (may already have been reparented)
-        if _is_ancestor(document.edges, anchor.id, heading.id):
-            continue  # this reparent would create a cycle — leave the original structure as-is
+            outcome = "missing_parent"
+        elif artifact_by_node.get(anchor.id) is None or artifact_by_node.get(anchor.id) != artifact_by_node.get(heading.id):
+            outcome = "artifact_boundary"
+        elif old_edge.properties.get("structural_source") in {"docx_outline", "pdf_outline"}:
+            outcome = "native_hierarchy"
+        elif anchor.id == heading.id or _is_ancestor(document.edges, anchor.id, heading.id):
+            outcome = "cycle"
+        elif old_edge.source_id == heading.id:
+            outcome = "already_parent"
+        if trace is not None:
+            trace.save(f"heading-outcomes/{index}.json", HeadingOutcome(
+                anchor_id=anchor.id, parent_id=heading.id, rationale=rationale, outcome=outcome,
+            ))
+        if outcome != "applied":
+            continue
 
         document.edges.remove(old_edge)
         document.edges.append(
@@ -1185,14 +1726,13 @@ def promote_heading_parents(
 
 # ---------------------------------------------------------------------------
 # Nesting a numbered subheading under its parent section — pure text pattern
-# matching, no VLM/API needed. Complements promote_heading_parents (VLM
-# judgment): that function has no idea "3.1" should be a child of "3" (it
-# only judges each content node individually, and never infers hierarchy
+# matching, no VLM/API needed. Complements propose_edges's HEADING_PARENT
+# judgment (VLM): that judgment has no idea "3.1" should be a child of "3"
+# (it only judges each content node individually, and never infers hierarchy
 # from a numbering scheme) — confirmed (1706.03762): only 2 of 13
 # subheadings ended up under their parent section (5.1->5, 6.1->6), the
 # other 11 stayed directly under the Artifact. This function fills that
-# specific gap deterministically and always correctly, from number parsing
-# alone.
+# gap using number parsing within the current Artifact and section instance.
 # ---------------------------------------------------------------------------
 
 _NUMBERED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+)*)[\s]+[A-Za-z]")
@@ -1210,33 +1750,37 @@ def nest_numbered_headings(document: ArticDocument) -> list[str]:
     digit — a letter has to come immediately after the number for it to
     count as a heading, a safeguard against a table data row like
     `"1 512 512 5.29 ..."` being mistaken for a heading just because it
-    starts with a digit, a counterexample confirmed empirically). Since the
-    parent is determined purely by number parsing ("3.1"'s parent is always
-    "3"), a cycle can never arise structurally — unlike
-    `promote_heading_parents`, no separate `_is_ancestor` check is needed.
+    starts with a digit, a counterexample confirmed empirically).
 
-    If two or more headings in the document share the same number (rare —
-    an extraction error, or a repeating document structure), only the first
-    one encountered is used as the parent. If the parent section's heading
-    can't be found (e.g. it's "3.1" but "3" itself isn't in the document),
-    that heading is left where it is (usually directly under the Artifact).
+    Only preceding headings in the same Artifact and still-open numbered
+    section are eligible. Repeated numbers start a new section instance;
+    TOC entries are excluded. Native hierarchy and cycle safety take
+    precedence over the textual pattern. Missing parents leave nodes intact.
 
     Returns: the list of heading node ids that were actually reparented."""
-    headings: dict[str, Node] = {}
-    for n in document.content_nodes():
-        if n.type != NodeType.TEXT:
-            continue
-        m = _NUMBERED_HEADING_RE.match(n.properties.get("text", "").strip())
-        if m and m.group(1) not in headings:  # only the first one (guards against duplicate numbers)
-            headings[m.group(1)] = n
-
+    artifact_by_node = _content_artifact_map(document)
+    headings_by_artifact: dict[str, dict[str, Node]] = {}
     nested: list[str] = []
-    for number, heading in headings.items():
+    for heading in document.content_nodes():
+        if heading.type != NodeType.TEXT or heading.properties.get("is_toc"):
+            continue
+        artifact_id = artifact_by_node.get(heading.id)
+        m = _NUMBERED_HEADING_RE.match(heading.properties.get("text", "").strip())
+        if artifact_id is None or m is None:
+            continue
+        number = m.group(1)
+        headings = headings_by_artifact.setdefault(artifact_id, {})
+        # Keep only strict ancestors of the new number: peers and their
+        # descendants belong to a section that has now ended.
+        for previous in list(headings):
+            if not number.startswith(previous + "."):
+                del headings[previous]
+        headings[number] = heading
         if "." not in number:
             continue  # a top-level section ("3") has no reparent target — leave as-is
         parent_number = number.rsplit(".", 1)[0]
         parent = headings.get(parent_number)
-        if parent is None or parent.id == heading.id:
+        if parent is None or _is_ancestor(document.edges, heading.id, parent.id):
             continue
         if _current_parent_id(document.edges, heading.id) == parent.id:
             continue  # already under the right parent
@@ -1244,19 +1788,97 @@ def nest_numbered_headings(document: ArticDocument) -> list[str]:
         old_edge = next(
             (e for e in document.edges if e.type == EdgeType.PARENT_OF and e.target_id == heading.id), None
         )
-        if old_edge is not None:
-            document.edges.remove(old_edge)
+        if old_edge is None or old_edge.properties.get("structural_source") in {"docx_outline", "pdf_outline"}:
+            continue
+        document.edges.remove(old_edge)
         document.edges.append(
             Edge(
                 type=EdgeType.PARENT_OF,
                 source_id=parent.id,
                 target_id=heading.id,
-                properties={"nested_by": "numbered_heading_pattern", "reparented_from": old_edge.source_id if old_edge else None},
+                properties={"nested_by": "numbered_heading_pattern", "reparented_from": old_edge.source_id},
             )
         )
         nested.append(heading.id)
 
     return nested
+
+
+# ---------------------------------------------------------------------------
+# Detecting a flat "1)/2)/3)" enumerated-sibling run — used by
+# `_propose_text_heading_parents` above to collapse the whole run into one
+# HEADING_PARENT question instead of one per member (see that function's
+# "Enumerated-sibling collapsing" docstring section for why). A different
+# pattern from nest_numbered_headings below ("N.M" hierarchical
+# subsections) — this one is a flat sibling list, not a nested hierarchy.
+# ---------------------------------------------------------------------------
+
+_ENUM_SIBLING_RE = re.compile(r"^(\d+)\)(?!\s*\d)")
+
+
+def _enumerated_sibling_groups(document: ArticDocument) -> list[list[Node]]:
+    """Runs of Text nodes sharing the same flat "N)" enumeration marker
+    (e.g. "1) 현상", "2) 원인", "3) ...") with consecutive, increasing-by-1
+    numbers, scoped to one Artifact — the numbering itself is proof they're
+    siblings under the same parent, independent of how far apart they sit
+    or what non-matching content (a sub-bullet, an embedded photo, ...)
+    happens to fall between them. `(?!\\d)` in `_ENUM_SIBLING_RE` keeps a
+    tabular row like "1) 512 512 ..." from being mistaken for an enumerated
+    item, the same safeguard `_NUMBERED_HEADING_RE` above uses for a
+    different pattern."""
+    artifact_by_node = _content_artifact_map(document)
+    groups: list[list[Node]] = []
+    current: list[Node] = []
+    current_number: int | None = None
+    current_artifact: str | None = None
+    current_list: tuple[int, int] | None = None
+    current_parent: str | None = None
+    for node in document.content_nodes():
+        if node.type != NodeType.TEXT:
+            continue
+        if node.properties.get("outline_level") is not None or node.properties.get("is_toc"):
+            if len(current) >= 2:
+                groups.append(current)
+            current, current_number, current_artifact, current_list = [], None, None, None
+            current_parent = None
+            continue
+        match = _ENUM_SIBLING_RE.match(node.properties.get("text", "").strip())
+        list_key = None
+        if "list_num_id" in node.properties and "list_level" in node.properties:
+            list_key = (node.properties["list_num_id"], node.properties["list_level"])
+        if match is None and list_key is None:
+            # Preserve the historical manual-marker behavior: non-numbered
+            # content (including an embedded image's neighboring paragraph)
+            # may sit between numbered siblings. Automatic lists are still
+            # grouped by their shared numId/ilvl when their members recur.
+            continue
+        number = int(match.group(1)) if match else None
+        artifact_id = artifact_by_node.get(node.id)
+        if artifact_id is None:
+            # No resolvable Artifact ancestor at all (shouldn't happen for a
+            # real extractor's output) — never bridge a group across this
+            # node, and never start one from it either (two `None`s must
+            # not equal each other into a false same-artifact match).
+            if len(current) >= 2:
+                groups.append(current)
+            current, current_number, current_artifact, current_list = [], None, None, None
+            continue
+        same_list = list_key is not None and list_key == current_list
+        same_manual = list_key is None and current_list is None and match is not None and current_number is not None and number == current_number + 1
+        parent_id = _current_parent_id(document.edges, node.id)
+        if current and artifact_id == current_artifact and parent_id == current_parent and (same_list or same_manual):
+            current.append(node)
+        else:
+            if len(current) >= 2:
+                groups.append(current)
+            current = [node]
+        current_number = number
+        current_artifact = artifact_id
+        current_list = list_key
+        current_parent = parent_id
+    if len(current) >= 2:
+        groups.append(current)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -1438,8 +2060,7 @@ def merge_fragmented_text(
     If the model says "don't merge" (`should_merge=False`), `merged_text` is
     empty, or the API call fails (the whole batch, for a batched call), that
     cluster is left fragmented as-is (the partial-failure principle, the
-    same one `propose_edges`/`promote_heading_parents` follow, applied at
-    the batch level).
+    same one `propose_edges` follows, applied at the batch level).
 
     Returns: the list of node ids that survive as the merge result (i.e.
     whose text was updated) — since this runs concurrently, the order may
@@ -1934,8 +2555,8 @@ def propose_synthetic_groups(
 
     **Candidate generation (deterministic)**: doesn't finalize any
     judgment. Only builds a list of sibling nodes ("a region") sharing the
-    same parent per the current `PARENT_OF` edges — if
-    `promote_heading_parents`/`nest_numbered_headings` were run first, the
+    same parent per the current `PARENT_OF` edges — if `propose_edges`'s
+    HEADING_PARENT judgment/`nest_numbered_headings` were run first, the
     siblings are already narrowed down under the correct section, and this
     function uses that result as-is. A region bigger than
     `_MAX_GROUP_REGION_NODES` is skipped (an arbitrary split could cut a
@@ -1955,7 +2576,7 @@ def propose_synthetic_groups(
     `document.nodes`, removes the existing `parent -PARENT_OF-> member`
     edges, and reparents as `parent -PARENT_OF-> Group -PARENT_OF-> each
     member`. Since Group is a brand-new node this time, a cycle can never
-    arise structurally (unlike `promote_heading_parents`, no `_is_ancestor`
+    arise structurally (unlike HEADING_PARENT reparenting, no `_is_ancestor`
     check is needed).
 
     **Partial failure**: if a batch call fails, only that batch's regions
@@ -2059,13 +2680,14 @@ def propose_synthetic_groups(
 def apply_vlm_enrichment(
     document: ArticDocument, client=None, model: str = DEFAULT_MODEL, *, include_text_anchors: bool = True,
     slide_images: dict[int, str | Path] | None = None,
+    trace_dir: str | Path | None = None,
 ) -> list[str]:
-    """`model` overrides every step's own default (`HEADING_MODEL`/
-    `MERGE_MODEL`/`SEMANTIC_MERGE_MODEL`/`GROUP_MODEL`, all normally
-    `DEFAULT_MODEL`) in one place — this bundle is exactly the "use the VLM
-    or not" on/off switch the CLI's `--vlm-enrichment` flag maps to, so a
-    caller that wants a non-default model shouldn't have to call the five
-    underlying functions by hand just to pass `model=` to each.
+    """`model` overrides every step's own default (`MERGE_MODEL`/
+    `SEMANTIC_MERGE_MODEL`/`GROUP_MODEL`, all normally `DEFAULT_MODEL`) in
+    one place — this bundle is exactly the "use the VLM or not" on/off
+    switch the CLI's `--vlm-enrichment` flag maps to, so a caller that wants
+    a non-default model shouldn't have to call the underlying functions by
+    hand just to pass `model=` to each.
 
     Optional `slide_images` maps every zero-based PPTX slide index to an
     external PNG/JPEG. These supply full-slide visual evidence to heading,
@@ -2073,44 +2695,52 @@ def apply_vlm_enrichment(
     documents with attached slide images. No external converter is invoked.
     Without supplied slide images, native PPTX reconstruction supplies layout evidence.
 
-    A convenience function that runs `merge_semantic_text_groups` +
-    `merge_fragmented_text` + `promote_heading_parents` +
-    `nest_numbered_headings` + `propose_edges` all at once — exactly the
-    bundle the CLI's `--vlm-enrichment` flag and the demo app's "VLM
-    enrichment" checkbox use. Three of them (`nest_numbered_headings` needs
-    no VLM, but it's always bundled in since it directly fills the
-    subheading-hierarchy gap `promote_heading_parents` leaves) are the same
-    `OPENAI_API_KEY`/model call anyway, so there's no reason for a call site
-    that just asks "use the VLM or not" as one switch (the CLI, the demo) to
-    turn them on/off separately.
+    `trace_dir` records the bundle's model calls and graph snapshots locally;
+    see `propose_edges` for the relation/heading diagnostic details.
 
-    **This function doesn't erase each function's trust-level
-    differences** — `merge_semantic_text_groups` merges semantic units from
-    the 2D layout, `merge_fragmented_text` merges same-line fragments into
-    one (both a VLM judgment), `propose_edges` still only adds edges, and
-    `promote_heading_parents`/`nest_numbered_headings` still delete and
-    reassert structural edges (the former a VLM judgment, the latter a
-    deterministic reparent based only on a number pattern — yet another
-    different trust level). This function only reduces the repetition of
-    calling those five steps together by hand each time — call the original
-    functions directly if you only need some of them.
+    A convenience function that runs `merge_semantic_text_groups` +
+    `merge_fragmented_text` + `propose_edges` (CAPTION_OF/REFERENCES/
+    HEADING_PARENT, `include_text_anchors` forwarded) + `nest_numbered_headings`
+    all at once — exactly the bundle the CLI's `--vlm-enrichment` flag and
+    the demo app's "VLM enrichment" checkbox use. `nest_numbered_headings`
+    needs no VLM, but it's always bundled in since it directly fills a gap
+    `propose_edges`'s HEADING_PARENT judgment structurally can't close on
+    its own (a hierarchical "N.M" subheading nesting the model has no
+    notion of — see that function's docstring; a *flat* "1)/2)/3)..."
+    enumerated-sibling run is instead handled inside `propose_edges` itself,
+    by collapsing the whole run into one HEADING_PARENT question rather
+    than patching it up afterward — see `_propose_text_heading_parents`'s
+    docstring); the rest are the same `OPENAI_API_KEY`/model call anyway, so
+    there's no reason for a call site that just asks "use the VLM or not"
+    as one switch (the CLI, the demo) to turn them on/off separately.
+
+    **This function doesn't erase each step's trust-level differences** —
+    `merge_semantic_text_groups` merges semantic units from the 2D layout,
+    `merge_fragmented_text` merges same-line fragments into one (both a VLM
+    judgment), `propose_edges`'s CAPTION_OF/REFERENCES still only adds
+    edges while its HEADING_PARENT reparents structurally (a VLM judgment
+    either way), and `nest_numbered_headings` also reparents structurally
+    but by a deterministic pattern only (yet another different trust
+    level). This function only reduces the repetition of calling those
+    steps together by hand each time — call the original functions
+    directly if you only need some of them.
 
     The order is `merge_semantic_text_groups` -> `merge_fragmented_text` ->
-    `promote_heading_parents` -> `nest_numbered_headings` ->
-    `propose_edges`. Running the merges first is because it's better for
-    the Table/Image-surrounding context text the other functions see to be
-    clean rather than fragmented, and putting `nest_numbered_headings`
-    right after `promote_heading_parents` is to definitively fix, using the
-    number pattern, a subheading-to-parent-section relationship the VLM
-    missed (or misplaced) (confirmed: in `1706.03762`, 11 of 13 subheadings
-    stayed directly under the Artifact with the VLM step alone, and
-    `nest_numbered_headings` cleaned up all of them using only the number
-    pattern). `client` is shared by the functions that need the API (since
-    each would otherwise create its own new `openai.OpenAI()` when
-    `client=None`).
+    `propose_edges` -> `nest_numbered_headings`. Running the merges first is
+    because it's better for the Table/Image-surrounding context text the
+    other functions see to be clean rather than fragmented, and putting
+    `nest_numbered_headings` right after `propose_edges` is to definitively
+    fix, using the number pattern, a subheading-to-parent-section
+    relationship the VLM missed (or misplaced) (confirmed: in `1706.03762`,
+    11 of 13 subheadings stayed directly under the Artifact with the VLM
+    step alone, and `nest_numbered_headings` cleaned up all of them using
+    only the number pattern). `client` is shared by the functions that need
+    the API (since each would otherwise create its own new
+    `openai.OpenAI()` when `client=None`).
 
-    The return value is the list of node ids actually reparented, as
-    returned by `promote_heading_parents` (the existing signature is kept)
+    The return value is the list of node ids `propose_edges`'s HEADING_PARENT
+    judgment actually reparented (captured right after that call, before
+    `nest_numbered_headings` adds its own — the existing signature is kept)
     — merged/re-nested node ids can each be found in `document.nodes` as
     nodes with `properties["merged_from"]`/`properties["nested_by"]`, and
     added CAPTION_OF/REFERENCES edges can be checked directly in
@@ -2122,15 +2752,24 @@ def apply_vlm_enrichment(
         attach_pptx_slide_images(document, slide_images)
 
     if client is None:
-        from openai import OpenAI  # lazy import — same reason as propose_edges/promote_heading_parents
+        from openai import OpenAI  # lazy import — same reason as propose_edges
 
         client = OpenAI()
 
+    if trace_dir is not None:
+        with trace_session(client, trace_dir, document) as traced:
+            return apply_vlm_enrichment(document, client=traced, model=model,
+                                        include_text_anchors=include_text_anchors)
+
     merge_semantic_text_groups(document, client=client, model=model)
     merge_fragmented_text(document, client=client, model=model)
-    promoted = promote_heading_parents(document, client=client, model=model, include_text_anchors=include_text_anchors)
+    proposals = propose_edges(document, client=client, model=model, include_text_anchors=include_text_anchors)
+    promoted = [
+        e.target_id for e in document.edges
+        if e.type == EdgeType.PARENT_OF and "reparented_from" in e.properties
+    ]
     nest_numbered_headings(document)
-    document.edges.extend(propose_edges(document, client=client, model=model))
+    document.edges.extend(proposals)
     if document.format == "pptx" and any(
         n.type == NodeType.ARTIFACT and n.properties.get("slide_image_path")
         for n in document.nodes

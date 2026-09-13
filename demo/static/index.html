@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Articling Demo — Graph View</title>
 <link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css" />
-<link rel="stylesheet" href="/style.css" />
+<link rel="stylesheet" href="/style.css?v=20260913" />
 <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
 </head>
 <body>
@@ -19,11 +19,11 @@
         <input id="fileInput" type="file" accept=".docx,.pptx,.xlsx,.pdf" hidden />
       </label>
       <div id="vlmGroup" class="vlm-group">
-        <label class="checkbox-field" id="vlmLabel" title="Runs relations.propose.apply_vlm_enrichment (merge_fragmented_text + promote_heading_parents + nest_numbered_headings + propose_edges)">
+        <label class="checkbox-field" id="vlmLabel" title="Runs relations.propose.apply_vlm_enrichment (merge_semantic_text_groups + merge_fragmented_text + propose_edges [CAPTION_OF/REFERENCES + HEADING_PARENT, one call per Table/Image anchor] + nest_numbered_headings)">
           <input id="vlmToggle" type="checkbox" checked />
-          VLM enrichment (headings + CAPTION_OF / REFERENCES)
+          VLM enrichment
         </label>
-        <label class="checkbox-field" id="groupsLabel" title="Runs relations.propose.propose_synthetic_groups — creates a synthetic Group node for sibling content with no heading in the source (e.g. an author roster), opt-in like promote_heading_parents">
+        <label class="checkbox-field" id="groupsLabel" title="Runs relations.propose.propose_synthetic_groups — creates a synthetic Group node for sibling content with no heading in the source (e.g. an author roster), opt-in like propose_edges's HEADING_PARENT role">
           <input id="groupsToggle" type="checkbox" />
           Synthetic groups (experimental)
         </label>
@@ -42,7 +42,7 @@
       <span id="fileMeta" class="muted"></span>
     </div>
 
-    <div id="statusArea"></div>
+    <div id="statusArea" role="status" aria-live="polite"></div>
   </header>
 
   <main id="split">

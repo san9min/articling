@@ -20,6 +20,18 @@ allowed-tools: Bash(articling:*) Bash(python3:*) Bash(python:*) Bash(pip:*)
 
 # Articling
 
+PDF extraction performs conservative native same-line fragment repair before
+optional VLM enrichment. Joined Text nodes retain original line/span evidence
+in `pdf_text_lines` (PDF points), source `pdf_block_numbers`, and
+`native_merged_by="same_line_continuation"`; ambiguous groups remain separate.
+
+For diagnosing optional VLM enrichment, `--trace-dir DIRECTORY` (SDK:
+`trace_dir=...` on `propose_edges` or `apply_vlm_enrichment`) saves actual
+inputs/images, parsed judgments, heading application reasons and graph
+snapshots locally. It is opt-in and records document content, not client
+credentials. See [relations](references/relations.md) and
+[Python SDK](references/python-sdk.md) for trust levels and trace details.
+
 Articling converts a document — DOCX, PPTX, XLSX, or PDF — into a single
 typed representation, the **`ArticDocument`**: a graph of `Node`s (`File`,
 `Artifact`, `Text`, `Table`, `Image`, `Group`) connected by `Edge`s (`PARENT_OF`,
@@ -73,12 +85,13 @@ numbered-subsection nesting + the caption/reference proposer
 | Build/inspect the graph programmatically | **Python SDK** (`extract()` + `ArticDocument`) | [references/python-sdk.md](references/python-sdk.md) |
 | Push a document's graph into Neo4j | **`export.neo4j`** (`to_cypher_script` / `push_to_neo4j`) | [references/neo4j.md](references/neo4j.md) |
 | Add caption/reference edges the extractor missed, or resolve ambiguous ones | **`relations.propose`** (LLM/VLM, human-review by default) | [references/relations.md](references/relations.md) |
-| Use XLSX/PPTX spatial layout to improve relation and heading-parent decisions | **`relations.propose.propose_edges` / `promote_heading_parents`** | [references/relations.md](references/relations.md) |
+| Use XLSX/PPTX spatial layout to improve relation and heading-parent decisions | **`relations.propose.propose_edges`** (CAPTION_OF/REFERENCES and, with `include_text_anchors`, HEADING_PARENT — judged together for a Table/Image anchor) | [references/relations.md](references/relations.md) |
 | Get `Table` nodes out of a PDF (`extract()` alone never does) | **`relations.table_structure.enrich_pdf_tables`** (opt-in, model-gated) | [references/pdf-tables.md](references/pdf-tables.md) |
 | Get `Image` nodes for PDF figures drawn as vector graphics, not raster (`extract()` alone never does) | **`extractors.pdf_figures.enrich_pdf_figures`** (opt-in, no model needed) | [references/pdf-figures.md](references/pdf-figures.md) |
 | Merge PDF `Text` fragments that are really one expression split across blocks (math with sub/superscripts) | **`relations.propose.merge_fragmented_text`** (opt-in, model-gated) | [references/relations.md](references/relations.md) |
 | Merge nearby PDF `Text` nodes that form one semantic unit in the 2D layout | **`relations.propose.merge_semantic_text_groups`** (opt-in, model-gated) | [references/relations.md](references/relations.md) |
-| Nest numbered subsection headings ("3.1") under their section ("3") — `promote_heading_parents` alone mostly misses this | **`relations.propose.nest_numbered_headings`** (opt-in, no model needed) | [references/relations.md](references/relations.md) |
+| Nest numbered subsection headings ("3.1") under their section ("3") — `propose_edges`'s HEADING_PARENT judgment alone mostly misses this | **`relations.propose.nest_numbered_headings`** (opt-in, no model needed) | [references/relations.md](references/relations.md) |
+| Avoid a HEADING_PARENT candidate-window limit missing a later member of a flat "1)/2)/3)..." enumerated list | Handled inside **`relations.propose.propose_edges`** itself — the whole run is asked about once, using its first member's own window, not once per member | [references/relations.md](references/relations.md) |
 | Reify sibling content that forms one unit with no heading in the source (author roster, KPI cards) into a synthetic `Group` node | **`relations.propose.propose_synthetic_groups`** (opt-in, model-gated) | [references/relations.md](references/relations.md) |
 
 Rules of thumb:

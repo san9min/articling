@@ -16,7 +16,7 @@ from articling.relations.propose import (
     _build_layout_crop_renderer, _SiblingRegionBatchResult,
     _SiblingRegionDecision, _SyntheticGroupCandidate, propose_synthetic_groups,
 )
-from articling.schema import NodeType, EdgeType
+from articling.schema import Edge, EdgeType, Node, NodeType
 from articling.scaffold import check_invariants
 
 
@@ -85,13 +85,29 @@ def test_enrichment_routes_external_evidence_to_all_three_stages(tmp_path):
     from articling.relations.propose import apply_vlm_enrichment, _HeadingParentChoice, _EdgeProposalResult
 
     doc, paths = setup_deck(tmp_path)
+    # `setup_deck`'s slide has only one Text (txt1, itself tbl1's caption),
+    # so with no second Text nearby there's no valid Text-anchor candidate
+    # for propose_edges's `include_text_anchors=True` pass (a Text anchor
+    # needs another Text as its heading candidate) — the Table/Image anchors
+    # alone would only exercise _EdgeProposalResult (HEADING_PARENT is
+    # judged together with CAPTION_OF/REFERENCES for them now) and
+    # _SiblingRegionBatchResult. Add a second Text after img1 so the
+    # Text-anchor HEADING_PARENT pass (still its own `_HeadingParentChoice`
+    # call, since it never needs CAPTION_OF/REFERENCES) gets exercised too.
+    slide = next(n for n in doc.nodes if n.type == NodeType.ARTIFACT)
+    txt2 = Node(
+        id='content:deck.pptx:s0:txt2', type=NodeType.TEXT, name='본문',
+        properties={'slide_index': 0, 'bbox': {'x_min': 50, 'y_min': 500, 'x_max': 450, 'y_max': 560}, 'text': '본문 설명'},
+    )
+    doc.nodes.append(txt2)
+    doc.edges.append(Edge(type=EdgeType.PARENT_OF, source_id=slide.id, target_id=txt2.id))
     calls = []
 
     def parse(**kwargs):
         calls.append(kwargs)
         schema = kwargs['text_format']
         if schema is _HeadingParentChoice:
-            result = schema(candidate_index=None, rationale='No heading')
+            result = schema(parent_index=None, rationale='No heading')
         elif schema is _EdgeProposalResult:
             result = schema(proposals=[])
         elif schema is _SiblingRegionBatchResult:

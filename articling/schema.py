@@ -33,10 +33,13 @@ The 6 node types:
 The 4 edge types:
     PARENT_OF  — hierarchical parent-child (deterministic by default,
                  File->Artifact->content, exactly two levels). Two opt-in
-                 exceptions: `relations/propose.py::promote_heading_parents`
-                 can reparent a heading Text -> Table/Image, deepening the
-                 tree by one level (an LLM judgment, not part of the default
-                 workflow), and `propose_synthetic_groups` can reparent
+                 exceptions: `relations/propose.py::propose_edges`'s
+                 HEADING_PARENT role can reparent a heading Text -> content,
+                 deepening the tree by one level (an LLM judgment, not part
+                 of the default workflow — judged in the same call as
+                 CAPTION_OF/REFERENCES for a Table/Image anchor, or via
+                 `include_text_anchors=True`'s separate pass for a Text
+                 anchor), and `propose_synthetic_groups` can reparent
                  several sibling nodes under a new Group node (see both
                  functions' docstrings). Each node has at most one
                  `PARENT_OF` parent (`scaffold.check_invariants`) — a
@@ -46,8 +49,21 @@ The 4 edge types:
                  Artifact are never linked by NEXT — Artifacts that aren't
                  slides (e.g. XLSX sheets) or formats with only one Artifact
                  (e.g. DOCX) never get a NEXT edge at all.
-    CAPTION_OF — a Text describes a Table/Image (LLM-proposed, for human review)
-    REFERENCES — the current node references another node (LLM-proposed, for human review)
+    CAPTION_OF — a Text describes a Table/Image. Two trust tiers: an explicit
+                 label prefix ("표 "/"Table "/"Figure "/...) is resolved
+                 deterministically (`scaffold.caption_prefix_edges`); with no
+                 such prefix, `relations/propose.py::propose_edges` proposes
+                 it as an LLM judgment, for human review.
+    REFERENCES — the current node references another node the way a
+                 citation points at its exact target, not a topical
+                 relationship. Same two tiers as CAPTION_OF: citing a
+                 caption's own label by name ("Figure 1", "표1") is resolved
+                 deterministically (`scaffold.reference_label_edges`); a
+                 pointer with no such label (quoting a specific value, or
+                 saying "as shown above" with no number) is an LLM proposal
+                 from `propose_edges`, for human review. pptx.py also adds a
+                 third, unrelated deterministic source: a drawn
+                 connector/arrow shape joining two nodes.
 """
 from __future__ import annotations
 

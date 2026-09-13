@@ -46,14 +46,24 @@ def extract(path: Path, ...) -> ArticDocument: ...
 
 ## Two trust tiers for CAPTION_OF / REFERENCES
 
-- **Deterministic heuristics** (e.g. a "표 "/"그림 " prefix immediately before
-  a Table/Image) are safe to append straight to `doc.edges` — they're cheap
-  and explainable, even when ambiguous (an extractor may attach the same
-  heuristic edge to both a preceding and following candidate on purpose,
-  leaving disambiguation to review or to `resolve_ambiguous_captions`).
-- **LLM-proposed edges** (`relations/propose.py::propose_edges`) are
-  candidates only — return them, never mutate `document.edges` in place.
-  Callers decide what to keep.
+- **Deterministic heuristics** are safe to append straight to `doc.edges` —
+  they're cheap and explainable, even when ambiguous (an extractor may
+  attach the same heuristic edge to both a preceding and following
+  candidate on purpose, leaving disambiguation to review or to
+  `resolve_ambiguous_captions`). `scaffold.caption_prefix_edges` (a
+  "표 "/"그림 " prefix immediately before a Table/Image → CAPTION_OF) and
+  `scaffold.reference_label_edges` (some other Text citing that same
+  caption's label by name, e.g. "Figure 1" → REFERENCES on the same anchor
+  — the same mechanism a paper's inline "[1]" has to its bibliography
+  entry) are this tier.
+- **LLM-proposed edges** (`relations/propose.py::propose_edges`) are a
+  *corrective* pass over what's left after the deterministic tier — candidates
+  only, return them, never mutate `document.edges` in place. Callers decide
+  what to keep. Keep REFERENCES's bar high here: a shared topic or a nearby
+  sentence is not a reference, only a checkable pointer (a specific quoted
+  value/identifier, or an explicit "as shown above" with no label) is — the
+  label-citation case is already the deterministic tier's job, don't
+  re-propose it.
 - `resolve_ambiguous_captions` is the one function that *does* mutate
   `document` in place, and that's deliberate: it only removes an already-
   proposed edge whose anchor isn't grounded by the VLM, never asserts a new

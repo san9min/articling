@@ -87,20 +87,47 @@ Checks: no dangling edges, `PARENT_OF` fan-in <= 1 per node (except `File`),
 
 ## Relation proposal and VLM captioning
 
-See [relations.md](relations.md) for `propose_edges`,
-`resolve_ambiguous_captions`, `promote_heading_parents`,
+See [relations.md](relations.md) for `propose_edges` (judges
+CAPTION_OF/REFERENCES and, with `include_text_anchors`, HEADING_PARENT
+reparenting — for a Table/Image anchor, both are judged in one VLM call; a
+flat "1)/2)/3)..." enumerated-sibling run is also collapsed into one
+HEADING_PARENT question, asked using the run's first member's own candidate
+window, rather than one independent question per member),
+`resolve_ambiguous_captions`,
 `merge_semantic_text_groups` (PDF-only, merges 2D layout-based semantic Text units),
 `merge_fragmented_text` (PDF-only, merges same-line `Text` fragments),
 `nest_numbered_headings` (no model needed — nests "3.1" under "3" by text
 pattern), `propose_synthetic_groups` (creates synthetic `Group` nodes for
 sibling content with no heading in the source, e.g. an author roster),
-`apply_vlm_enrichment` (runs five of these together — not
+`apply_vlm_enrichment` (runs four of these together — not
 `propose_synthetic_groups`, which stays a separate opt-in call), and
 `caption_content_nodes` — all optional, most `OPENAI_API_KEY`-gated
 (`pip install "articling[relations]"` — `nest_numbered_headings` is the one
-exception, needs neither). Only `propose_edges` leaves `doc`
-untouched (returns candidates for the caller to `.extend()`); the rest
-mutate `doc` in place — `promote_heading_parents`/`propose_synthetic_groups`/
+exception, needing neither). `propose_edges`'s CAPTION_OF/REFERENCES half
+leaves `doc` untouched (returns candidates for the caller to `.extend()`);
+its HEADING_PARENT half mutates `doc` in place directly, same as the rest
+of the mutating functions below — `propose_edges`/`propose_synthetic_groups`/
 `apply_vlm_enrichment` are the riskiest since they delete and reassert (or,
 for `propose_synthetic_groups`, insert) structural `PARENT_OF` edges, not
 just add or remove proposals.
+
+PDF Text nodes preserve `pdf_text_lines` (original line/span text, bbox,
+baseline origin, direction and typography in PDF points) and
+`pdf_block_numbers`. Extraction can join tightly adjacent horizontal fragments
+before graph creation, marked `native_merged_by="same_line_continuation"`.
+This uses no API; node bbox coordinates still use the normalized 0–1000 scale.
+
+`propose_edges(..., trace_dir="/tmp/articling-traces")` and
+`apply_vlm_enrichment(..., trace_dir="/tmp/articling-traces")` optionally save
+local diagnostic evidence in a unique run directory. `calls/*/call.json`
+retains model/instructions/input/schema and parsed output, including nulls
+and API error types. Image previews sit beside each call. For relation and
+heading calls, `anchors` maps anchor indices and ordered candidate indices
+to node IDs. `heading-outcomes/` explains applied or rejected parent changes;
+`heading-groups.json` lists collapsed sibling runs with the representative first.
+`relation-proposals.json` separates returned candidates from applied edges.
+`before.json`, `relations-before.json`, `relations-after.json`, and `after.json`
+use the ordinary `ArticDocument` schema. Bundle tracing also captures merge
+and synthetic-group API requests. Trace files include document content;
+client credentials and exception messages are not serialized. No extra API
+calls are made, and tracing is disabled by default.

@@ -38,7 +38,7 @@ that has sub/superscripts: MuPDF splits one line into multiple blocks
 because of slightly different font size/baseline spans, and scrambles their
 relative order (confirmed: `1706.03762`'s MultiHead attention formula came
 out with "Q, K, V" order as "Q, V, K", see
-`docs/vlm-integration-research.md` §11). Text is never merged — merging
+`docs/vlm-integration-research.md` §11). This reorder step never merges text — merging
 would be riskier (the same document also had two authors' names sitting
 side by side on the same line: "Ashish Vaswani∗" and "Noam Shazeer∗" —
 merging those would corrupt the data instead). Instead, **only order is
@@ -48,6 +48,12 @@ side-by-side subheadings, or a list of author names (no counterexample
 found). Since only order changes and each block still stays an independent
 Node, there's no risk of misjudging what to merge and mashing different
 semantic units together.
+
+After reordering, `_merge_native_fragments` separately restores only tightly
+adjacent horizontal single-line fragments with matching baseline/typography
+and no intervening image/drawing. Original line/span geometry is retained in
+PDF points. Multi-line, rotated, numeric-only, and ambiguous fragments remain
+independent for optional VLM enrichment.
 
 Node: Text (paragraph block), Image (raster image block — there's no notion
       of "inside a table cell" for PDF, so it's always top-level content).
@@ -63,15 +69,116 @@ Edge: PARENT_OF (Artifact -> content), CAPTION_OF (the same deterministic
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pymupdf
+from pydantic import BaseModel, Field
 
 from .._geometry import cluster_indices
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from ..scaffold import caption_prefix_edges, file_node, parent_edges, resolve_capture_dir, save_image_bytes
+from ..scaffold import caption_prefix_edges, file_node, parent_edges, reference_label_edges, resolve_capture_dir, save_image_bytes
 
 _LINE_Y_OVERLAP = 0.5  # y must overlap at least this much to count as "the same line" and get its x order fixed
 _LINE_MAX_HEIGHT = 30.0  # only considered a reorder candidate when both are at or under this height (pt) (explained below)
+
+
+class PdfTextSpan(BaseModel):
+    """Source typography/geometry in PDF points, retained without rewriting."""
+    text: str
+    bbox: tuple[float, float, float, float]
+    origin: tuple[float, float]
+    font: str
+    size: float
+    flags: int
+    color: int
+
+
+class PdfTextLine(BaseModel):
+    bbox: tuple[float, float, float, float]
+    direction: tuple[float, float] = Field(alias="dir")
+    wmode: int
+    spans: list[PdfTextSpan]
+
+
+def _block_text(block: dict) -> str:
+    return "\n".join("".join(span["text"] for span in line["spans"]) for line in block["lines"])
+
+
+def _joinable_fragments(left: dict, right: dict, barriers: list[tuple], reference: dict) -> bool:
+    """Conservative physical continuation, not semantic paragraph grouping.
+
+    All tolerances scale with font size in PDF points. In particular, bbox
+    overlap alone cannot distinguish rotated plot labels from a text line.
+    """
+    for block in (left, right):
+        if block["type"] != 0 or len(block["lines"]) != 1:
+            return False
+        line = block["lines"][0]
+        if line["wmode"] != 0 or tuple(line["dir"]) != (1.0, 0.0):
+            return False
+        # Numeric cells and isolated punctuation are ambiguous without
+        # semantic evidence, even when there are no visible table rules.
+        if not any(c.isalpha() for c in _block_text(block)):
+            return False
+    # Compare against the run's first span as well: pairwise tolerance must
+    # not accumulate into a drifting baseline or progressively changing font.
+    spans = reference["lines"][0]["spans"] + left["lines"][0]["spans"] + right["lines"][0]["spans"]
+    first = spans[0]
+    size = first["size"]
+    if size <= 0 or any(
+        span["font"] != first["font"] or span["flags"] != first["flags"]
+        or span["color"] != first["color"]
+        or abs(span["size"] - size) > size * 0.02
+        or abs(span["origin"][1] - first["origin"][1]) > size * 0.02
+        for span in spans
+    ):
+        return False
+    a, b = left["bbox"], right["bbox"]
+    gap = b[0] - a[2]
+    if not (-size * 0.02 <= gap <= size * 0.3):
+        return False
+    # An intervening rule, drawing, or image is stronger boundary evidence
+    # than matching typography. Include zero-width vertical rules.
+    return not any(
+        x0 <= b[0] and x1 >= a[2] and y0 < min(a[3], b[3]) and y1 > max(a[1], b[1])
+        for x0, y0, x1, y1 in barriers
+    )
+
+
+def _merge_native_fragments(blocks: list[dict], barriers: list[tuple]) -> list[dict]:
+    """Join only consecutive compatible single-line blocks before node IDs
+    and edges exist. Keep original lines and block numbers for inspection.
+    """
+    result: list[dict] = []
+    run: list[dict] = []
+
+    def flush() -> None:
+        if not run:
+            return
+        if len(run) == 1:
+            result.append(run[0])
+            return
+        merged = dict(run[0])
+        value = _block_text(run[0])
+        for previous, following in zip(run, run[1:]):
+            tail = _block_text(following)
+            gap = following["bbox"][0] - previous["bbox"][2]
+            size = previous["lines"][0]["spans"][-1]["size"]
+            separator = " " if gap > size * 0.08 and not value[-1:].isspace() and not tail[:1].isspace() else ""
+            value += separator + tail
+        merged["native_text"] = value
+        merged["source_block_numbers"] = [b["number"] for b in run]
+        merged["lines"] = [line for b in run for line in b["lines"]]
+        merged["bbox"] = tuple(fn(b["bbox"][i] for b in run) for i, fn in enumerate((min, min, max, max)))
+        result.append(merged)
+
+    for block in blocks:
+        if run and not _joinable_fragments(run[-1], block, barriers, run[0]):
+            flush()
+            run = []
+        run.append(block)
+    flush()
+    return result
 
 
 def _y_overlap_frac(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
@@ -155,6 +262,81 @@ def _resort_pdf_content_nodes(document: ArticDocument) -> None:
     document.nodes = head + content
 
 
+def _normalise_outline_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _outline_structure(pdf, artifact: Node, content: list[Node]) -> list[Edge]:
+    """Use PDF bookmarks as a conservative semantic outline.
+
+    ``get_toc()`` is navigation metadata, not source text. It is therefore
+    matched to an existing Text block on the referenced page; unmatched
+    entries contribute to the Artifact's outline counts but never become
+    invented nodes. Only matched heading-to-heading hierarchy is asserted;
+    navigation metadata does not prove ownership of intervening body blocks.
+    """
+    toc = pdf.get_toc(simple=False) or []
+    artifact.properties["outline_count"] = len(toc)
+    if not toc:
+        return [*parent_edges(artifact, content)]
+    by_page: dict[int, list[Node]] = {}
+    for node in content:
+        if node.type == NodeType.TEXT:
+            by_page.setdefault(node.properties.get("page_index", -1), []).append(node)
+    matched: list[tuple[int, Node | None]] = []
+    used: set[str] = set()
+    for entry in toc:
+        if len(entry) < 3:
+            continue
+        level, title, page_number = entry[:3]
+        if not isinstance(level, int) or level < 1 or not isinstance(page_number, int):
+            continue
+        needle = _normalise_outline_text(str(title))
+        choices = by_page.get(page_number - 1, [])
+        # Match the whole block, optionally preceded by a section number.
+        # A mention in body prose is not the heading itself.
+        eligible = [n for n in choices if needle and n.id not in used and
+                    re.sub(r"^\d+(?:\.\d+)*\.?\s+", "",
+                           _normalise_outline_text(n.properties.get("text", ""))) == needle]
+        candidate = eligible[0] if len(eligible) == 1 else None
+        destination = entry[3] if len(entry) > 3 else {}
+        if len(eligible) > 1 and destination.get("to") is not None:
+            page = pdf[page_number - 1]
+            point = pymupdf.Point(destination["to"])
+            # Named destinations returned as LINK_NAMED use PDF coordinates;
+            # direct LINK_GOTO destinations already use page coordinates.
+            if destination.get("kind") == pymupdf.LINK_NAMED:
+                point = point * page.transformation_matrix
+            x = point.x / page.rect.width * 1000
+            y = point.y / page.rect.height * 1000
+            def distance(node: Node) -> float:
+                b = node.properties["bbox"]
+                return max(b["x_min"] - x, 0, x - b["x_max"]) + max(b["y_min"] - y, 0, y - b["y_max"])
+            ranked = sorted(eligible, key=distance)
+            if distance(ranked[0]) < distance(ranked[1]):
+                candidate = ranked[0]
+        matched.append((level, candidate))
+        if candidate is None:
+            continue
+        used.add(candidate.id)
+        candidate.properties.update(outline_level=level - 1, outline_title=str(title), outline_page=page_number)
+    artifact.properties["outline_matched_count"] = len(used)
+    edges = {edge.target_id: edge for edge in parent_edges(artifact, content)}
+    stack: list[tuple[int, Node | None]] = []
+    for level, node in matched:
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        parent = stack[-1][1] if stack else artifact
+        if node is not None and parent is not None and parent.id != node.id:
+            edge = parent_edges(parent, [node])[0]
+            edge.properties["structural_source"] = "pdf_outline"
+            edges[node.id] = edge
+        stack.append((level, node))
+    # An outline proves relationships between matched headings, not ownership
+    # of every intervening block (unlisted sections, footnotes, references).
+    return list(edges.values())
+
+
 def extract(
     path: Path,
     capture_dir: Path | None = None,
@@ -220,19 +402,22 @@ def extract(
     content_nodes: list[Node] = []
     counters = {"p": 0, "img": 0}
 
+    toc = []
     try:
+        toc = pdf.get_toc(simple=False) or []
         for page_index in range(pdf.page_count):
             page = pdf[page_index]
             w, h = page.rect.width, page.rect.height
             raw = page.get_text("dict", sort=True)
             page_blocks = _reorder_same_line_blocks(raw["blocks"])
+            barriers = [tuple(drawing["rect"]) for drawing in page.get_drawings()]
+            barriers.extend(tuple(b["bbox"]) for b in raw["blocks"] if b["type"] == 1)
+            page_blocks = _merge_native_fragments(page_blocks, barriers)
 
             for block in page_blocks:
                 bbox = _normalized_bbox(block["bbox"], w, h)
                 if block["type"] == 0:  # text block
-                    text = "\n".join(
-                        "".join(span["text"] for span in line["spans"]) for line in block["lines"]
-                    ).strip()
+                    text = block.get("native_text", _block_text(block)).strip()
                     if not text:
                         continue
                     counters["p"] += 1
@@ -245,6 +430,11 @@ def extract(
                             "text": text,
                             "page_index": page_index,
                             "bbox": bbox,
+                            # Native line/span geometry stays in PDF points;
+                            # the node bbox above remains normalized 0..1000.
+                            "pdf_text_lines": [PdfTextLine.model_validate(line).model_dump(mode="json", by_alias=True) for line in block["lines"]],
+                            "pdf_block_numbers": block.get("source_block_numbers", [block["number"]]),
+                            **({"native_merged_by": "same_line_continuation"} if "native_text" in block else {}),
                         },
                     ))
                 elif block["type"] == 1:  # image block — already carries the raw bytes
@@ -267,13 +457,16 @@ def extract(
                         name=f"Inline image {counters['img']} (p.{page_index + 1})",
                         properties=props,
                     ))
+        outline_edges = _outline_structure(pdf, artifact, content_nodes)
     finally:
         pdf.close()
 
     nodes.extend(content_nodes)
-    edges.extend(parent_edges(artifact, content_nodes))
+    edges.extend(outline_edges)
 
-    edges.extend(caption_prefix_edges(content_nodes))
+    caption_edges = caption_prefix_edges(content_nodes)
+    edges.extend(caption_edges)
+    edges.extend(reference_label_edges(content_nodes, caption_edges))
 
     document = ArticDocument(source_path=str(path.resolve()), format="pdf", nodes=nodes, edges=edges)
 

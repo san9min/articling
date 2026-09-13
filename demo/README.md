@@ -29,6 +29,17 @@ a detail panel (a table shows the engine's composited capture PNG, an image
 shows the original bytes). The summary bar at the top shows node/edge
 counts, elapsed time, and `scaffold.check_invariants` results as chips.
 
+The upload header expands for long filenames and wrapped options. Progress
+and error messages occupy their own row above the graph, so they remain
+readable without overlapping the graph toolbar.
+
+To retain VLM diagnostic evidence, start the demo with
+`ARTICLING_TRACE_DIR=/tmp/articling-traces python3 demo/app.py` from the repository
+root. With VLM enrichment enabled, each extraction saves a separate run under
+that directory, grouped by session ID. The trace includes document text/images,
+actual requests, parsed judgments and before/after graphs, but no API key.
+Tracing is off when this environment variable is unset; it does not add API calls.
+
 For a document with many nodes (hundreds), the graph auto-shrinks a lot to
 fit everything on screen, making it hard to click an individual node
 precisely, especially a small Image node — zoom in with the **+ / − / Fit**
@@ -41,17 +52,20 @@ Detection").
 
 ### VLM enrichment (opt-in — needs the most careful handling)
 
-Turning on the **"VLM enrichment (headings + CAPTION_OF / REFERENCES)"**
+Turning on the **"VLM enrichment"**
 checkbox next to the upload button runs
 `relations.propose.apply_vlm_enrichment(doc)` right after extraction,
 applying every VLM enrichment — the same behavior as the CLI's
-`--vlm-enrichment` flag. Under the hood it's still four functions at
-different trust levels (only #3 needs no API; the rest need the same
+`--vlm-enrichment` flag. Under the hood it's still four steps at
+different trust levels (only #4 needs no API; the rest need the same
 `OPENAI_API_KEY`/model call, so there was no reason to expose them as
 separate switches in the frontend — that doesn't erase the trust-level
-differences between the four functions below):
+differences between the steps below):
 
-1. `relations.propose.merge_fragmented_text(doc)` — PDF only (silently a
+1. `relations.propose.merge_semantic_text_groups(doc)` — PDF only. Merges
+   PDF Text nodes into complete semantic units from the page's 2D layout
+   (a name+affiliation+email, a title split across blocks, ...).
+2. `relations.propose.merge_fragmented_text(doc)` — PDF only (silently a
    no-op on other formats). Among same-line text fragments (the problem of
    inline math with sub/superscripts splitting into several blocks) whose
    **order**
@@ -60,34 +74,44 @@ differences between the four functions below):
    geometry alone can't tell "a split expression" from "two unrelated
    things that happen to share a line" (confirmed: two authors' names on
    the same line), so the judgment is left to a VLM.
-2. `relations.propose.promote_heading_parents(doc, include_text_anchors=True)`
-   — if the model judges that a Table/Image's (and a body
-   paragraph's/subheading's) actual parent is a nearby heading/section
-   title Text, it **reparents** the deterministically created `Artifact →
-   content` PARENT_OF to `heading Text → content` (deepening the tree by
-   one level) — getting closer to a real document outline. This crosses the
-   trust boundary much further than `propose_edges` (additive only) — it
+3. `relations.propose.propose_edges(doc, include_text_anchors=True)` — for
+   each Table/Image, judges CAPTION_OF/REFERENCES **and** HEADING_PARENT
+   together in **one call**: CAPTION_OF/REFERENCES proposals are added
+   straight onto `doc.edges`, while a HEADING_PARENT pick **reparents** the
+   deterministically created `Artifact → content` PARENT_OF to `heading
+   Text → content` (deepening the tree by one level) directly — getting
+   closer to a real document outline. HEADING_PARENT crosses the trust
+   boundary much further than CAPTION_OF/REFERENCES (additive only) — it
    **deletes a deterministic structural edge** and reasserts a new one
    based on an LLM judgment. Since the worst failure mode is "reparenting
    the structure incorrectly," before using it see
    [relations.md](../articling/.agents/skills/articling/references/relations.md)
-   or the README's "PARENT_OF Reparenting" section. Since Text is also a
-   reparent target (as many as there are paragraphs), the number of anchors
-   grows too, but pixel-less anchors are handled with batching+concurrency,
-   confirmed to cut the time from 753s to 98s (about 7.7x) (see README
-   "Batching and Concurrency"). Cycle risk is checked by the function
-   itself (checking before each reparent whether it would create a cycle)
-   to prevent it.
-3. `relations.propose.nest_numbered_headings(doc)` — needs no VLM/API, pure
-   text pattern matching. #2 only judges each content node individually and
-   has no notion that a heading numbered "3.1" should go under "3" —
-   confirmed (`1706.03762`): only 2 of 15 subheadings ended up under their
-   parent section with step #2 alone. This function fills that gap using
-   only number parsing ("3.2.1" goes under "3.2", not "3" — since the
-   parent is determined purely by number, this can never create a cycle
-   structurally, unlike #2, so it has no cycle check).
-4. `relations.propose.propose_edges(doc)` — adds the result straight onto
-   `doc.edges`.
+   or the README's "PARENT_OF Reparenting" section. `include_text_anchors=True`
+   additionally judges HEADING_PARENT for every paragraph Text too — its
+   own separate, batched pass (since CAPTION_OF/REFERENCES never apply to a
+   Text anchor), confirmed to cut the time from 753s to 98s (about 7.7x)
+   for that many-paragraph case (see README "Batching and Concurrency").
+   Cycle risk is checked before every reparent to prevent it (`_is_ancestor`).
+   A flat "1) .../2) .../3) ..." enumerated-sibling run is collapsed into
+   **one** HEADING_PARENT question rather than one per member — a bounded
+   candidate window can push a section's own heading out of a later
+   member's candidates entirely (confirmed on a real xlsx document: "1)"'s
+   own window reached the shared heading fine, but "3)"'s own window was
+   exactly consumed by "1)", "2)", and an unrelated sub-bullet before ever
+   reaching that same heading a few lines further up — no layout image
+   rescues this, since the model can only pick an index from the candidates
+   it was actually given). The run's own numbering is used to ask once,
+   using the run's first (heading-closest) member's own window, and apply
+   that single answer to every member.
+4. `relations.propose.nest_numbered_headings(doc)` — needs no VLM/API, pure
+   text pattern matching, for a different (hierarchical "N.M") pattern.
+   Step #3's HEADING_PARENT judgment only considers each content node
+   individually and has no notion that a heading numbered "3.1" should go
+   under "3" — confirmed (`1706.03762`): only 2 of 15 subheadings ended up
+   under their parent section with step #3 alone. This function fills that
+   gap using only number parsing ("3.2.1" goes under "3.2", not "3" — since
+   the parent is determined purely by number, this can never create a cycle
+   structurally, unlike #3, so it has no cycle check).
 
 Off by default (the same opt-in principle as the CLI — it costs money, and
 it's a "proposal" premised on human review, not a final answer. See README

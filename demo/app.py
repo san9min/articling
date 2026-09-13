@@ -17,10 +17,13 @@ returned normally.
 Turning on the `vlm_enrichment` option (one checkbox in the frontend, off
 by default) runs `relations.propose.apply_vlm_enrichment(doc)` right after
 extraction, applying every VLM-based enrichment — the same behavior as the
-CLI's `--vlm-enrichment` flag. Under the hood it's still four functions at
+CLI's `--vlm-enrichment` flag. Under the hood it's still four steps at
 different trust levels:
 
-1. `relations.propose.merge_fragmented_text(doc)` — PDF only (silently a
+1. `relations.propose.merge_semantic_text_groups(doc)` — PDF only. Merges
+   PDF Text nodes into complete semantic units from the page's 2D layout
+   (a name+affiliation+email, a title split across blocks, ...).
+2. `relations.propose.merge_fragmented_text(doc)` — PDF only (silently a
    no-op on other formats). Among same-line text fragments whose **order**
    `extractors/pdf._reorder_same_line_blocks` has already fixed, merges the
    ones the model judges are "really one split expression" (the problem of
@@ -29,33 +32,44 @@ different trust levels:
    tell "a split expression" from "two unrelated things that happen to
    share a line" (confirmed: two authors' names on the same line), so the
    judgment is left to a VLM.
-2. `relations.propose.promote_heading_parents(doc, include_text_anchors=True)`
-   — if the model judges that a Text that looks like a heading/section
-   title is the real parent of a nearby Table/Image (and other Text body
-   paragraphs/subheadings), it reparents the deterministically created
-   `Artifact -> content` PARENT_OF to `heading Text -> content` (deepening
-   the tree) — the one point in this project where LLM involvement is
-   opened up for PARENT_OF at all, so it needs the most careful handling
-   (see the function docstring). With `include_text_anchors=True`, API
-   calls grow with the number of paragraphs and can get slow. Cycle
-   prevention is handled by the function itself via `_is_ancestor`.
-3. `relations.propose.nest_numbered_headings(doc)` — needs no VLM/API, pure
-   text pattern matching. #2 only judges each content node individually and
-   has no notion that "3.1" should go under "3" — confirmed
-   (`1706.03762`): only 2 of 15 subheadings ended up under their parent
-   section with step #2 alone. This function always correctly fills that
-   gap using only number parsing ("3.2.1" goes under "3.2", not "3").
-4. `relations.propose.propose_edges` — adds the CAPTION_OF/REFERENCES edges
-   the LLM proposes onto the graph.
+3. `relations.propose.propose_edges(doc, include_text_anchors=True)` — for
+   each Table/Image, judges CAPTION_OF/REFERENCES **and** HEADING_PARENT
+   together in one call: CAPTION_OF/REFERENCES are added to the graph as
+   proposals (see below), while a HEADING_PARENT pick reparents the
+   deterministically created `Artifact -> content` PARENT_OF to
+   `heading Text -> content` (deepening the tree) directly — the one point
+   in this project where LLM involvement is opened up for PARENT_OF at all,
+   so it needs the most careful handling (see the function docstring).
+   `include_text_anchors=True` additionally judges HEADING_PARENT for every
+   paragraph Text too (its own separate, batched pass, since
+   CAPTION_OF/REFERENCES never apply to a Text anchor) — API calls grow
+   with the number of paragraphs and can get slow. Cycle prevention is
+   handled by the function itself via `_is_ancestor`. A flat
+   "1) .../2) .../3) ..." enumerated-sibling run is collapsed into **one**
+   HEADING_PARENT question rather than one per member — a bounded candidate
+   window can push a section's own heading out of a later member's
+   candidates entirely (confirmed on a real xlsx document: "1)"'s own
+   window reached the shared heading fine, but "3)"'s own window was
+   exactly consumed by "1)", "2)", and an unrelated sub-bullet before ever
+   reaching that same heading a few lines further up), so the run's own
+   numbering is used to ask once, using the run's first (heading-closest)
+   member's own window, and apply that single answer to every member.
+4. `relations.propose.nest_numbered_headings(doc)` — needs no VLM/API, pure
+   text pattern matching, for a different (hierarchical "N.M") pattern.
+   Step #3's HEADING_PARENT judgment only considers each content node
+   individually and has no notion that "3.1" should go under "3" —
+   confirmed (`1706.03762`): only 2 of 15 subheadings ended up under their
+   parent section with step #3 alone. This function always correctly fills
+   that gap using only number parsing ("3.2.1" goes under "3.2", not "3").
 
-`apply_vlm_enrichment` itself (#3 the only exception, needing no API) is
-just a convenience function bundling these because the rest need the same
+`apply_vlm_enrichment` itself (#4 the only exception, needing no
+API) is just a convenience function bundling these because the rest need the same
 OPENAI_API_KEY/model call anyway, so there's no reason to expose them
-individually in the frontend — it doesn't erase the four functions'
-trust-level differences (structural merge/reparent vs. deterministic
-reparent vs. additive only) (see the function docstrings). Why it's opt-in:
-see README "CAPTION_OF / REFERENCES Proposals" — it costs money and is a
-"proposal" premised on human review, not a final answer.
+individually in the frontend — it doesn't erase these steps' trust-level
+differences (structural merge/reparent vs. deterministic reparent vs.
+additive only) (see the function docstrings). Why it's opt-in: see README
+"CAPTION_OF / REFERENCES Proposals" — it costs money and is a "proposal"
+premised on human review, not a final answer.
 
 The `synthetic_groups` option (a separate frontend checkbox, off by
 default) runs `relations.propose.propose_synthetic_groups(doc)` — when a
@@ -63,12 +77,12 @@ VLM judges that several sibling nodes (e.g. several author
 name+affiliation+email blocks) form one conceptual unit even with no
 explicit heading/container in the source, it creates a new `Group` node
 (`synthetic=True`) and reparents them under it. It's at the same level as
-`promote_heading_parents` (creating new structure and reparenting), so it
-isn't bundled into `apply_vlm_enrichment` and is exposed as a separate
-checkbox — it can be turned on independently of `vlm_enrichment`, but
-running it after heading reparenting has already finished (turning that on
-first) gives a narrower, more accurate sibling candidate region (confirmed:
-`docs/vlm-integration-research.md` §15).
+`propose_edges`'s HEADING_PARENT role (creating new structure and
+reparenting), so it isn't bundled into `apply_vlm_enrichment` and is
+exposed as a separate checkbox — it can be turned on independently of
+`vlm_enrichment`, but running it after heading reparenting has already
+finished (turning that on first) gives a narrower, more accurate sibling
+candidate region (confirmed: `docs/vlm-integration-research.md` §15).
 
 **`GET /api/status`** (`openai_key_configured`) and `/api/extract`'s
 `openai_api_key` form field — let the browser accept a key directly and try
@@ -341,8 +355,8 @@ def extract_document(
 
             client = OpenAI(api_key=resolved_key)  # use the browser-entered key or the server's .env key (resolved_key) as-is
             # Cheaply check upfront whether the key itself is wrong —
-            # merge_fragmented_text/promote_heading_parents/propose_edges/
-            # propose_synthetic_groups all follow the partial-failure
+            # merge_fragmented_text/propose_edges/propose_synthetic_groups
+            # all follow the partial-failure
             # principle of "if one anchor/cluster/batch fails, skip just
             # that one and keep going" (intentional by the library's design
             # — meant for a normal case where only some calls fail, like a
@@ -364,13 +378,13 @@ def extract_document(
         try:
             from articling.relations.propose import apply_vlm_enrichment
 
-            apply_vlm_enrichment(doc, client=client)
+            trace_root = os.environ.get("ARTICLING_TRACE_DIR")
+            apply_vlm_enrichment(doc, client=client, trace_dir=Path(trace_root) / session_id if trace_root else None)
         except Exception as exc:  # noqa: BLE001 — a genuinely exceptional case (partial failure is already handled inside the function)
-            # both promote_heading_parents/propose_edges already skip a
-            # single failed anchor internally, so an exception reaching
-            # this far is a genuinely exceptional case like client creation
-            # failing — leave the full traceback in the server console for
-            # diagnosis.
+            # propose_edges already skips a single failed anchor internally,
+            # so an exception reaching this far is a genuinely exceptional
+            # case like client creation failing — leave the full traceback
+            # in the server console for diagnosis.
             traceback.print_exc()
             warnings.append(f"VLM enrichment failed (the deterministic graph is still returned normally): {exc!r}")
 
@@ -378,9 +392,9 @@ def extract_document(
         try:
             from articling.relations.propose import propose_synthetic_groups
 
-            # At the same level of opt-in as `promote_heading_parents`
-            # (creating new structure and reparenting), so it isn't bundled
-            # into `apply_vlm_enrichment` (see README "Synthetic Group
+            # At the same level of opt-in as `propose_edges`'s
+            # HEADING_PARENT role (creating new structure and reparenting),
+            # so it isn't bundled into `apply_vlm_enrichment` (see README "Synthetic Group
             # Node") — the demo exposes that same trust-level distinction
             # as a separate checkbox. If `vlm_enrichment` was turned on
             # first, heading reparenting has already finished, giving a
