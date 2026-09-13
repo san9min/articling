@@ -262,6 +262,32 @@ false positive in a deterministic reparenting function would, which is
 exactly why it's safe to recognize a looser "bare numbered section" pattern
 here than `nest_numbered_headings` would ever reparent on its own.
 
+**Second-pass confirmed-heading retry** (`_retry_flat_text_anchors_with_confirmed_headings`,
+docx/pdf only, run once right after pass 1's Text-anchor reparents are
+applied): the widening above only recognizes a small, deliberately narrow
+set of text patterns — a real heading with no such marker at all (arbitrary
+bold/large-font text, no number/circle/bracket) still depends purely on
+`window` and can still be missed by distance alone. But once pass 1 has
+run, *some* of those unmarked headings are no longer guesses: any node pass
+1 actually reparented a child under is now a **deterministically confirmed**
+heading (the model already put something under it), independent of whether
+it matches any pattern. Pass 2 offers this expanded, still-growing set to
+whatever's still left flat, using the same distance-unlimited nearest-
+preceding-occurrence mechanism as the marker widening above
+(`_widen_with_confirmed_headings`). It's still a bounded, one-shot *pass* —
+not a running "hierarchy context" threaded through the model call to call
+(a design considered and deliberately rejected: it would break the
+independence `_propose_heading_parents_batch`'s own prompt insists on —
+"evaluate each anchor independently" — letting one wrong judgment corrupt
+every later one's candidates with no way back, and it would serialize what
+`_judge_heading_parent_windows`'s `ThreadPoolExecutor` currently runs
+concurrently, likely trading a smaller call count for *more* wall-clock
+time, not less — see "Batching and concurrency" above for the measured
+concurrency win this would give up). Only anchors where the confirmed-
+heading bonus actually adds a genuinely new candidate are retried, so pass
+2's extra cost scales with new opportunities, not with how many anchors
+happened to stay flat.
+
 **Caption/reference exclusion** (`_caption_or_reference_source_ids`,
 consumed by `_propose_text_heading_parents`'s `excluded_candidate_ids`): a
 Text already judged — deterministically (`caption_prefix_edges`/
@@ -1340,7 +1366,12 @@ def propose_edges(
     per paragraph." CAPTION_OF/REFERENCES are never judged for a Text
     anchor, so this runs as its own batched pass (`batch_size`/`max_workers`
     — see the module docstring's "Batching and concurrency"), not merged
-    into the one-call-per-anchor path above.
+    into the one-call-per-anchor path above. For docx/pdf, a second,
+    targeted retry pass follows automatically (see the module docstring's
+    "Second-pass confirmed-heading retry"): any Text anchor still left flat
+    gets one more independent, concurrent judgment offering it a heading pass
+    1 already confirmed elsewhere in the document, even with no recognizable
+    text marker of its own.
 
     If `client` isn't given, `openai.OpenAI()` is built with its default
     constructor (needs the `OPENAI_API_KEY` environment variable) — this is
@@ -1423,10 +1454,23 @@ def propose_edges(
                     excluded_candidate_ids=_caption_or_reference_source_ids(document, proposals),
                 )
             )
+
+        # Applied here, inside the try block, so pass 2 (below) can see the
+        # confirmed structure while `layout_crop_fn` is still open — see the
+        # module comment above `_widen_with_confirmed_headings`.
+        _apply_heading_reparents(document, model, heading_reparents, trace=client if isinstance(client, TraceClient) else None)
+
+        if include_text_anchors:
+            retry_reparents = _retry_flat_text_anchors_with_confirmed_headings(
+                document, client, model, window,
+                layout_crop_fn=layout_crop_fn,
+                batch_size=batch_size, max_workers=max_workers,
+                excluded_candidate_ids=_caption_or_reference_source_ids(document, proposals),
+            )
+            _apply_heading_reparents(document, model, retry_reparents, trace=client if isinstance(client, TraceClient) else None)
     finally:
         close_layout_resources()
 
-    _apply_heading_reparents(document, model, heading_reparents, trace=client if isinstance(client, TraceClient) else None)
     if isinstance(client, TraceClient):
         client.save("relations-after.json", document)
         client.save("relation-proposals.json", ProposalRecord(proposals=proposals))
@@ -1726,6 +1770,33 @@ def _propose_text_heading_parents(
             [node.id for node in group] for group in group_by_representative_id.values()
         ]))
 
+    return _judge_heading_parent_windows(
+        client, model, windows, group_by_representative_id,
+        layout_crop_fn=layout_crop_fn, batch_size=batch_size, max_workers=max_workers,
+    )
+
+
+def _judge_heading_parent_windows(
+    client, model: str, windows: list[tuple[Node, list[Node]]],
+    group_by_representative_id: dict[str, list[Node]],
+    *,
+    layout_crop_fn: Callable[[Node, list[Node]], bytes | None],
+    batch_size: int,
+    max_workers: int,
+) -> list[tuple[Node, Node, str]]:
+    """The batched/concurrent judgment core shared by
+    `_propose_text_heading_parents` (pass 1: every Text anchor) and
+    `_retry_flat_text_anchors_with_confirmed_headings` (pass 2: only the
+    anchors pass 1 left flat) — see either caller's own docstring for what
+    builds `windows`/`group_by_representative_id` and why. Splits `windows`
+    into anchors with visual material (isolated pixel or layout crop —
+    judged one call each via `_propose_heading_parent`) and text-only
+    anchors (grouped into `batch_size` chunks, one call each via
+    `_propose_heading_parents_batch`), then runs every call concurrently up
+    to `max_workers` (see `_propose_text_heading_parents`'s "Batching and
+    concurrency" for the measured speedup this buys). A failed call/batch
+    (the partial-failure principle) simply leaves those anchors out of the
+    result rather than aborting the rest."""
     visual_windows = [(anchor, candidates, layout_crop_fn(anchor, candidates)) for anchor, candidates in windows]
 
     def _has_isolated_pixel(anchor: Node) -> bool:
@@ -1787,6 +1858,150 @@ def _propose_text_heading_parents(
         for target in group_by_representative_id.get(anchor.id, [anchor]):
             reparents.append((target, heading, rationale))
     return reparents
+
+
+# ---------------------------------------------------------------------------
+# Second-pass retry (docx/pdf) — confirming an *actual* heading beats
+# guessing at one. `_widen_with_open_headings` above widens every anchor
+# once, before any VLM call, using only text-pattern markers; a real
+# heading with no such marker (arbitrary bold/large-font text, no number or
+# bracket) still relies purely on `window` and can still be missed by
+# distance. But once pass 1 has already run, *some* of those real headings
+# are no longer guesses — a node that pass 1 (either anchor pass) actually
+# reparented a child under is now a **deterministically confirmed** heading
+# (it's not "does this look like a marker," it's "the model already put
+# something under it"), independent of which pattern it does or doesn't
+# match. A second, targeted pass offers this expanded, still-growing set of
+# confirmed headings to whatever's still left flat.
+#
+# This is deliberately a bounded *pass*, not a serially-threaded model
+# state: pass 2's anchors are still judged independently and concurrently,
+# exactly like pass 1 (see `_judge_heading_parent_windows`) — a wrong
+# judgment on one flat anchor can't corrupt another's candidates the way a
+# running "current hierarchy" state fed forward call-to-call would, and nothing
+# here loses the `ThreadPoolExecutor` concurrency pass 1 already relies on
+# for its measured speedup. Only anchors where the confirmed-heading bonus
+# actually adds a *new* candidate not already in their pass-1 window are
+# retried — asking the same question again with the same candidates that
+# already failed to produce an answer wouldn't accomplish anything, so this
+# keeps pass 2's extra cost proportional to genuinely new opportunities, not
+# to how many anchors stayed flat.
+# ---------------------------------------------------------------------------
+
+
+def _widen_with_confirmed_headings(
+    content: list[Node], windows: list[tuple[Node, list[Node]]], confirmed_heading_ids: set[str]
+) -> list[tuple[Node, list[Node]]]:
+    """Like `_widen_with_open_headings`, but the "marker family" is a single
+    dynamic one: membership in `confirmed_heading_ids` (nodes pass 1 already
+    reparented at least one child under — see the module comment above).
+    Adds each anchor's nearest preceding confirmed heading, scanned with no
+    distance limit, same as the marker-based widening.
+
+    Same `numbered_section` guard as `_widen_with_open_headings` — confirmed
+    on the same real PDF that motivated this pass: a *later* top-level
+    numbered section ("1. 국민안전...") was left flat by pass 1 (correctly:
+    a numbered_section anchor never gets an out-of-family bonus there), but
+    pass 2 had no such restriction and offered it a confirmed heading from
+    *outside* its own family ("< 2025년 주요 추진과제 >", confirmed only
+    because pass 1 attached an unrelated Image caption under it) — the VLM
+    accepted it, nesting one top-level section under a page-local label
+    while its numbered siblings ("2."/"3."/"4.") correctly stayed root
+    siblings, an inconsistent tree. A numbered-section anchor is the root of
+    its own subtree and must not get a bonus from pass 2 either."""
+    id_to_index = {n.id: i for i, n in enumerate(content)}
+    last_confirmed: Node | None = None
+    confirmed_before: list[Node | None] = []
+    for node in content:
+        confirmed_before.append(last_confirmed)
+        if node.type == NodeType.TEXT and node.id in confirmed_heading_ids:
+            last_confirmed = node
+
+    widened = []
+    for anchor, candidates in windows:
+        index = id_to_index.get(anchor.id)
+        bonus = confirmed_before[index] if index is not None else None
+        is_numbered_section_anchor = "numbered_section" in _open_heading_marker_families(
+            anchor.properties.get("text", "")
+        )
+        if (
+            bonus is None
+            or is_numbered_section_anchor
+            or bonus.id in {c.id for c in candidates}
+            or bonus.id == anchor.id
+        ):
+            widened.append((anchor, candidates))
+            continue
+        widened.append((anchor, [*candidates, bonus]))
+    return widened
+
+
+def _retry_flat_text_anchors_with_confirmed_headings(
+    document: ArticDocument,
+    client,
+    model: str,
+    window: int,
+    *,
+    layout_crop_fn: Callable[[Node, list[Node]], bytes | None],
+    batch_size: int,
+    max_workers: int,
+    excluded_candidate_ids: set[str] = frozenset(),
+) -> list[tuple[Node, Node, str]]:
+    """Pass 2 of `propose_edges(..., include_text_anchors=True)` — see the
+    module comment above `_widen_with_confirmed_headings` for the rationale.
+    Call *after* pass 1's reparents (`_propose_text_heading_parents`) are
+    already applied to `document`, so `confirmed_heading_ids` reflects
+    everything pass 1 actually confirmed.
+
+    Scoped to docx/pdf, matching `_widen_with_open_headings` — xlsx/pptx
+    already use their own bespoke, tested candidate strategies (spatial
+    ranking, full-slide proximity) that this hasn't been confirmed against.
+    A no-op (returns `[]` immediately) if there are no confirmed headings to
+    retry with, or the anchor set to retry (still-flat Text with a widened
+    window that actually changed) is empty — the common case once pass 1
+    has already resolved most of a document."""
+    if document.format not in {"docx", "pdf"}:
+        return []
+    confirmed_heading_ids = {
+        e.source_id for e in document.edges
+        if e.type == EdgeType.PARENT_OF and "reparented_from" in e.properties
+    }
+    if not confirmed_heading_ids:
+        return []
+
+    artifact_by_node = _content_artifact_map(document)
+    content = [node for node in document.content_nodes() if not node.properties.get("is_toc")]
+
+    def _is_flat(node: Node) -> bool:
+        parent_id = _current_parent_id(document.edges, node.id)
+        return parent_id is not None and parent_id == artifact_by_node.get(node.id)
+
+    windows = _build_document_context_windows(
+        document, window=window, anchor_types=(NodeType.TEXT,), boundary_types=()
+    )
+    windows = [(anchor, candidates) for anchor, candidates in windows if _is_flat(anchor)]
+    if excluded_candidate_ids:
+        windows = [
+            (anchor, [c for c in candidates if c.id not in excluded_candidate_ids])
+            for anchor, candidates in windows
+        ]
+
+    before_widen = {a.id: {c.id for c in cands} for a, cands in windows}
+    windows = _widen_with_confirmed_headings(content, windows, confirmed_heading_ids)
+    # Only retry an anchor the widening actually gave something new — see
+    # this section's module comment for why (bounds pass 2's cost to
+    # genuinely new opportunities).
+    windows = [
+        (anchor, candidates) for anchor, candidates in windows
+        if {c.id for c in candidates} != before_widen.get(anchor.id, set())
+    ]
+    if not windows:
+        return []
+
+    return _judge_heading_parent_windows(
+        client, model, windows, {},
+        layout_crop_fn=layout_crop_fn, batch_size=batch_size, max_workers=max_workers,
+    )
 
 
 def _apply_heading_reparents(document: ArticDocument, model: str, reparents: list[tuple[Node, Node, str]], *, trace: TraceClient | None = None) -> list[str]:
