@@ -64,6 +64,7 @@ const state = {
   currentEdges: [],
   network: null,
   activeSessionId: null,
+  pendingFile: null, // the File picked/dropped, held until the run modal's "Run extraction" confirms it
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -83,6 +84,11 @@ const drawer = $("#detailDrawer");
 const detailContent = $("#detailContent");
 const sessionListEl = $("#sessionList");
 const sessionCountEl = $("#sessionCount");
+const uploadModalOverlay = $("#uploadModalOverlay");
+const modalFileName = $("#modalFileName");
+const uploadModalRun = $("#uploadModalRun");
+const uploadModalCancel = $("#uploadModalCancel");
+const uploadModalClose = $("#uploadModalClose");
 
 // A large document (hundreds of nodes) shrinks the scale down to around 0.1
 // to fit everything on screen, making it effectively impossible to click an
@@ -145,7 +151,7 @@ apiKeyInput.addEventListener("input", () => {
 
 fileInput.addEventListener("change", () => {
   const f = fileInput.files[0];
-  if (f) uploadFile(f);
+  if (f) openUploadModal(f);
 });
 
 $("#closeDrawer").addEventListener("click", closeDrawer);
@@ -160,7 +166,45 @@ $("#sidebarToggle").addEventListener("click", () => {
 );
 document.addEventListener("drop", (e) => {
   const f = e.dataTransfer.files[0];
-  if (f) uploadFile(f);
+  if (f) openUploadModal(f);
+});
+
+// ---------- run-extraction modal ----------
+//
+// Picking/dropping a file used to fire the upload immediately, with no
+// chance to flip VLM enrichment/synthetic groups first (they only applied
+// on the *next* upload since they're plain checkboxes read at upload time).
+// This modal is the one place both the file and those settings are
+// confirmed together, right before the request actually goes out.
+
+function openUploadModal(file) {
+  state.pendingFile = file;
+  modalFileName.textContent = `${file.name} · ${(file.size / 1e6).toFixed(1)}MB`;
+  refreshVlmAvailability(); // re-check key availability each time, in case the key field changed since the last run
+  uploadModalOverlay.hidden = false;
+}
+
+function closeUploadModal() {
+  uploadModalOverlay.hidden = true;
+  state.pendingFile = null;
+  fileInput.value = ""; // otherwise re-picking the same file wouldn't fire "change" again
+}
+
+uploadModalRun.addEventListener("click", () => {
+  const file = state.pendingFile;
+  uploadModalOverlay.hidden = true;
+  state.pendingFile = null;
+  fileInput.value = "";
+  if (file) uploadFile(file);
+});
+
+uploadModalCancel.addEventListener("click", closeUploadModal);
+uploadModalClose.addEventListener("click", closeUploadModal);
+uploadModalOverlay.addEventListener("click", (e) => {
+  if (e.target === uploadModalOverlay) closeUploadModal(); // click on the backdrop, not the modal card itself
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !uploadModalOverlay.hidden) closeUploadModal();
 });
 
 function setStatus(text, kind) {
@@ -326,10 +370,21 @@ function renderSessionList(items, activeId) {
       const isActive = item.session_id === activeId;
       const time = new Date(item.mtime * 1000).toLocaleString();
       const id = escapeHtml(item.session_id);
+      // A base run and a VLM-enriched/synthetic-groups run of the same
+      // filename are now kept as separate sessions (app.py's
+      // _find_existing_session_id) instead of overwriting each other, so
+      // tags here are what tells otherwise-identically-titled rows apart.
+      const tags = [];
+      if (item.vlm_enrichment) tags.push("VLM");
+      if (item.synthetic_groups) tags.push("Groups");
+      const tagsHtml = tags.length
+        ? `<span class="tags">${tags.map((t) => `<span class="session-tag">${t}</span>`).join("")}</span>`
+        : "";
       return `<div class="session-row${isActive ? " active" : ""}" data-session-id="${id}">
         <button type="button" class="session-item" data-session-id="${id}" title="${escapeHtml(item.filename)}">
           <span class="title">${escapeHtml(item.filename)}</span>
           <span class="time">${escapeHtml(time)}</span>
+          ${tagsHtml}
         </button>
         <button type="button" class="session-delete" data-session-id="${id}" title="Delete this session" aria-label="Delete this session">×</button>
       </div>`;

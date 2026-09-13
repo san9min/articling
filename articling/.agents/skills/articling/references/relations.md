@@ -425,7 +425,14 @@ model, but it's bundled in because it directly closes the hierarchical
 "N.M" subheading gap `propose_edges`'s HEADING_PARENT judgment leaves — the
 flat "1)/2)/3)..." enumerated-sibling gap is instead closed inside
 `propose_edges` itself, by collapsing the whole run into one question, see
-above). It does not change the trust levels above: `propose_edges`'s
+above). Since `nest_numbered_headings` needs no model, both the CLI and the
+demo app also call it once, unconditionally, right after extraction —
+*before* `--vlm-enrichment`/the checkbox is even considered, so a caller
+with no `OPENAI_API_KEY` still gets it. This bundle's own call re-runs it a
+second time (a no-op wherever a node is already under the right parent)
+because `propose_edges`'s HEADING_PARENT judgment can move a numbered
+heading to a different section that the earlier, pre-VLM call couldn't see
+yet. It does not change the trust levels above: `propose_edges`'s
 CAPTION_OF/REFERENCES half still only adds, its HEADING_PARENT half still
 deletes and reasserts structural `PARENT_OF` edges on a model's say-so,
 `nest_numbered_headings` still does the same deterministically,

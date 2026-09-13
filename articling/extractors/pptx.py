@@ -50,7 +50,8 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
 
 from ..schema import ArticDocument, Edge, EdgeType, Node, NodeType
-from ..scaffold import caption_prefix_edges, file_node, parent_edges, reference_label_edges, resolve_capture_dir, save_image_bytes
+from ..structure import finalize_structure
+from ..scaffold import file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
 # An embedded/linked OLE object (e.g. an Excel worksheet dropped onto a
 # slide) has no python-pptx picture API at all — without this, `_classify_shape`
@@ -665,12 +666,9 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
             seen_references.add(key)
             edges.append(edge)
 
-        caption_edges = caption_prefix_edges(content)
-        edges.extend(caption_edges)
-        edges.extend(reference_label_edges(content, caption_edges))
 
     # NEXT between slides (between Artifacts) — the File -> Artifact PARENT_OF edge was already added above
     for a, b in zip(artifacts, artifacts[1:]):
         edges.append(Edge(type=EdgeType.NEXT, source_id=a.id, target_id=b.id))
 
-    return ArticDocument(source_path=str(path.resolve()), format="pptx", nodes=nodes, edges=edges)
+    return finalize_structure(ArticDocument(source_path=str(path.resolve()), format="pptx", nodes=nodes, edges=edges))

@@ -14,6 +14,16 @@ apply with no checkbox. Even on failure (rare, since it's a deterministic
 step) only a warning shows in the summary bar and the rest of the result is
 returned normally.
 
+Every format also always has `relations.propose.nest_numbered_headings`
+(nests "3.1" under "3" by text pattern alone) on for the same reason — pure
+text matching needing no VLM/API key, see the function's own docstring
+(see [docs/extraction-details.md](../docs/extraction-details.md) "DOCX and
+numbered headings"). It used to run only as part of `apply_vlm_enrichment`,
+leaving a user with no `OPENAI_API_KEY` with none of this free structure;
+it's still called again inside `apply_vlm_enrichment` when VLM enrichment is
+on, since that call's own HEADING_PARENT reparenting can move a numbered
+heading to a new section that this earlier call couldn't see yet.
+
 Turning on the `vlm_enrichment` option (one checkbox in the frontend, off
 by default) runs `relations.propose.apply_vlm_enrichment(doc)` right after
 extraction, applying every VLM-based enrichment — the same behavior as the
@@ -213,14 +223,20 @@ def _serialize_nodes(doc: ArticDocument, session_id: str, session_dir: Path) -> 
     return out
 
 
-def _find_existing_session_id(filename: str) -> str | None:
-    """If a session already exists with the same original filename (the
-    `filename` field in `result.json`, exactly as the browser sent it on
-    upload), returns that `session_id` — so that re-extraction overwrites
-    this session instead of creating a new one (avoiding duplicate entries
-    with the same title piling up in the sidebar). Compares by filename
-    only, not content — re-uploading different content under the same name
-    is still treated as "the same file" and overwritten."""
+def _find_existing_session_id(filename: str, vlm_enrichment: bool, synthetic_groups: bool) -> str | None:
+    """If a session already exists with the same original filename *and* the
+    same enrichment settings (the `filename`/`vlm_enrichment`/
+    `synthetic_groups` fields in `result.json`, the latter two as requested
+    on upload, exactly as the browser sent them), returns that `session_id`
+    — so that re-extraction overwrites this session instead of creating a
+    new one (avoiding duplicate entries with the same title piling up in the
+    sidebar). Settings are part of the identity on purpose: the base
+    (deterministic) graph and a VLM-enriched one are different results worth
+    keeping side by side, not overwriting each other just because the
+    filename matches — only re-running with the *same* settings is treated
+    as "redo this" and overwrites. Compares by filename/settings only, not
+    file content — re-uploading different content under the same name and
+    settings is still treated as "the same session" and overwritten."""
     for session_dir in SESSIONS_DIR.iterdir():
         if not session_dir.is_dir():
             continue
@@ -231,7 +247,12 @@ def _find_existing_session_id(filename: str) -> str | None:
             data = json.loads(result_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        if isinstance(data, dict) and data.get("filename") == filename:
+        if (
+            isinstance(data, dict)
+            and data.get("filename") == filename
+            and bool(data.get("vlm_enrichment")) == vlm_enrichment
+            and bool(data.get("synthetic_groups")) == synthetic_groups
+        ):
             return session_dir.name
     return None
 
@@ -263,6 +284,8 @@ def list_sessions() -> JSONResponse:
                 "session_id": session_dir.name,
                 "filename": data.get("filename") or session_dir.name,
                 "mtime": result_path.stat().st_mtime,
+                "vlm_enrichment": bool(data.get("vlm_enrichment")),
+                "synthetic_groups": bool(data.get("synthetic_groups")),
             }
         )
     items.sort(key=lambda item: item["mtime"], reverse=True)
@@ -290,14 +313,26 @@ def extract_document(
     if suffix not in EXTRACTORS:
         raise HTTPException(400, f"Unsupported file extension: {suffix!r} (supported: {sorted(EXTRACTORS)})")
 
-    # If a session already exists with the same original filename, don't
-    # create a new one — overwrite that session (keeping the same
-    # session_id) — instead of piling up duplicate titles in the sidebar
-    # list, running it again updates the existing entry with the latest
-    # result and moves it to the top. Deletes the old captures/original
-    # file wholesale and recreates them so the previous run's capture PNGs
-    # don't stick around as orphaned files.
-    existing_session_id = _find_existing_session_id(file.filename or "")
+    # The as-requested settings are the session's identity (see
+    # _find_existing_session_id) and what gets persisted to result.json —
+    # `vlm_enrichment`/`synthetic_groups` themselves get downgraded to False
+    # below when there's no usable API key, but that's about what actually
+    # ran, not about which session this upload belongs to/should overwrite.
+    requested_vlm_enrichment, requested_synthetic_groups = vlm_enrichment, synthetic_groups
+
+    # If a session already exists with the same original filename *and* the
+    # same enrichment settings, don't create a new one — overwrite that
+    # session (keeping the same session_id) — instead of piling up duplicate
+    # titles in the sidebar list, running it again with the same settings
+    # updates the existing entry with the latest result and moves it to the
+    # top. A different combination of vlm_enrichment/synthetic_groups is
+    # kept as its own session instead (the base graph and a VLM-enriched one
+    # are different results worth comparing, not overwriting). Deletes the
+    # old captures/original file wholesale and recreates them so the
+    # previous run's capture PNGs don't stick around as orphaned files.
+    existing_session_id = _find_existing_session_id(
+        file.filename or "", requested_vlm_enrichment, requested_synthetic_groups
+    )
     session_id = existing_session_id or uuid.uuid4().hex[:12]
     session_dir = SESSIONS_DIR / session_id
     if existing_session_id:
@@ -319,6 +354,21 @@ def extract_document(
         raise HTTPException(500, f"Extraction failed: {exc}") from exc
 
     warnings: list[str] = []
+
+    # Needs no VLM/API key — pure text pattern matching ("3.1" under "3"),
+    # see nest_numbered_headings's own docstring — so, like PDF vector
+    # figure detection below, it's applied unconditionally to every format
+    # here, not gated behind the "VLM enrichment" checkbox. Still re-run
+    # inside apply_vlm_enrichment when that checkbox is on (see its
+    # docstring): its own HEADING_PARENT reparenting can move a numbered
+    # heading to a new section, which this call alone can't see yet.
+    try:
+        from articling.relations.propose import nest_numbered_headings
+
+        nest_numbered_headings(doc)
+    except Exception as exc:  # noqa: BLE001 — a deterministic step, but a failure doesn't block the whole thing
+        traceback.print_exc()
+        warnings.append(f"Numbered-heading nesting failed (returning the graph as extracted): {exc!r}")
 
     if suffix == ".pdf":
         # detects figures drawn as vector graphics (plots/heatmaps etc.,
@@ -409,6 +459,12 @@ def extract_document(
     result = {
         "session_id": session_id,
         "filename": file.filename,
+        # As-requested, not the possibly-downgraded local variables — this
+        # is what makes a base run and a VLM-enriched run of the same file
+        # distinct sessions (see _find_existing_session_id) rather than
+        # overwriting each other.
+        "vlm_enrichment": requested_vlm_enrichment,
+        "synthetic_groups": requested_synthetic_groups,
         "elapsed_sec": round(elapsed, 3),
         "summary": _summarize(doc),
         "nodes": _serialize_nodes(doc, session_id, session_dir),

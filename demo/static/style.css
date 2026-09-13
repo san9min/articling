@@ -184,6 +184,88 @@ h1, h2, h3, p { margin: 0; }
 
 #fileMeta { font-size: 12px; letter-spacing: 0.32px; min-width: 0; overflow-wrap: anywhere; }
 
+/* ---------- run-extraction modal ---------- */
+/* Picking/dropping a file opens this instead of running immediately, so
+   VLM enrichment/synthetic groups are confirmed together with the file
+   right before the request goes out (see openUploadModal in app.js). */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(22, 22, 22, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  width: min(480px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  background: var(--canvas);
+  border: 1px solid var(--hairline-strong);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--hairline);
+}
+.modal-header h2 { font-size: 16px; font-weight: 600; }
+
+.modal-body { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+
+.modal-filename {
+  font-size: 13px;
+  letter-spacing: 0.16px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  padding: 8px 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+}
+
+.modal-body .vlm-group { flex-direction: column; align-items: flex-start; gap: 10px; }
+.modal-body .api-key-input { width: 100%; }
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 16px 20px;
+  border-top: 1px solid var(--hairline);
+}
+
+.btn-primary, .btn-secondary {
+  cursor: pointer;
+  padding: 8px 16px;
+  border-radius: 0;
+  font-size: 14px;
+  font-family: inherit;
+  letter-spacing: 0.16px;
+  transition: background-color 70ms ease;
+}
+.btn-primary {
+  background: var(--primary);
+  color: var(--on-primary);
+  border: 1px solid var(--primary);
+}
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-primary:active { background: var(--primary-pressed); }
+.btn-secondary {
+  background: var(--canvas);
+  color: var(--ink);
+  border: 1px solid var(--hairline-strong);
+}
+.btn-secondary:hover { background: var(--surface-1); }
+.btn-secondary:active { background: var(--surface-2); }
+
 #statusArea {
   flex: 1 1 100%;
   min-width: 0;
@@ -261,6 +343,17 @@ h1, h2, h3, p { margin: 0; }
   word-break: break-all;
 }
 .session-item .time { display: block; margin-top: 3px; font-size: 11px; color: var(--ink-muted); letter-spacing: 0.16px; }
+.session-item .tags { display: block; margin-top: 3px; }
+.session-tag {
+  display: inline-block;
+  margin-right: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  font-size: 10px;
+  letter-spacing: 0.16px;
+  color: var(--ink-muted);
+}
 
 .session-delete {
   flex: 0 0 auto;

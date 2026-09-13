@@ -73,7 +73,8 @@ from ..capture.xlsx_capture import (
 )
 from ..capture.xlsx_chart_capture import extract_chart_data, parse_theme_colors, render_chart_image
 from ..schema import ArticDocument, Edge, Node, NodeType
-from ..scaffold import caption_prefix_edges, file_node, parent_edges, reference_label_edges, resolve_capture_dir, save_image_bytes
+from ..structure import finalize_structure
+from ..scaffold import file_node, parent_edges, resolve_capture_dir, save_image_bytes
 
 
 def _table_ranges(ws) -> dict[tuple[int, int, int, int], str]:
@@ -695,9 +696,6 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
         # own sort just above) starting with "표 "/"Table "/... is its
         # caption, and any other cell on the sheet citing that same label by
         # name (e.g. "Table 1") gets a REFERENCES edge to it.
-        caption_edges = caption_prefix_edges(content)
-        edges.extend(caption_edges)
-        edges.extend(reference_label_edges(content, caption_edges))
 
     # Sheets aren't linked by NEXT to each other — NEXT is currently only
     # used for pptx.py's slide order.
@@ -719,4 +717,4 @@ def extract(path: Path, capture_dir: Path | None = None) -> ArticDocument:
             stacklevel=2,
         )
 
-    return ArticDocument(source_path=str(path.resolve()), format="xlsx", nodes=nodes, edges=edges)
+    return finalize_structure(ArticDocument(source_path=str(path.resolve()), format="xlsx", nodes=nodes, edges=edges))

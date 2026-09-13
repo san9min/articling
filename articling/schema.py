@@ -5,7 +5,7 @@ A document-graph schema that follows the Artic notation from
 
 The 6 node types:
     File     — one file (name = node name, location is metadata)
-    Artifact — one PPT slide / one Excel tab / a whole DOC·PDF document (one page)
+    Artifact — one PPT slide / one Excel tab / a whole DOCX or PDF document
     Text     — any text not contained in a Table/Image
     Table    — any table not contained in an Image
     Image    — any image not contained in a Table
@@ -31,8 +31,12 @@ The 6 node types:
                unchanged.
 
 The 4 edge types:
-    PARENT_OF  — hierarchical parent-child (deterministic by default,
-                 File->Artifact->content, exactly two levels). Two opt-in
+    PARENT_OF  — interpreted hierarchy, separate from source placement stored
+                 in content properties.native_location (artifact_id/page_index).
+                 DOCX outline levels and matched PDF bookmarks use the shared
+                 structure hierarchy engine across page boundaries.
+                 Hierarchical parent-child (deterministic by default,
+                 File->Artifact->content, deepened by native outline evidence). Two opt-in
                  exceptions: `relations/propose.py::propose_edges`'s
                  HEADING_PARENT role can reparent a heading Text -> content,
                  deepening the tree by one level (an LLM judgment, not part
