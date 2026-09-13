@@ -238,6 +238,30 @@ REFERENCES eligibility (`caption_eligible_ids`) is computed before this widening
 never touched by it, so a candidate borrowed only from a sibling's window
 still can't become *this* image's own caption/reference.
 
+**Open-heading window widening** (`_widen_with_open_headings`, docx/pdf
+only, inside `_build_document_context_windows`): the row-sibling widening
+above still leaves every anchor's own window bounded by `CONTEXT_WINDOW` in
+document order — a section with more paragraphs than the window holds can
+push its own true ancestor heading out of a *later* paragraph's candidates
+entirely, no matter the window size, since the problem is distance, not
+count. Confirmed on a real PDF (a 2025 government press release): a
+subsection heading correctly found its immediate parent (close enough to be
+in-window), but that parent itself never found *its* own parent — several
+paragraphs further back — and was left a flat Artifact child instead, with
+everything under it inheriting the same fate. Fix: every anchor's candidates
+are widened with the nearest preceding occurrence of each recognized
+"safe" structural-marker family (a circled number like "①", a short
+"< label >" fully wrapped in angle brackets, or a bare/dot-terminated
+top-level numbered section like "1." or "1 Title" — Latin or not, distinct
+from `nest_numbered_headings`'s own hierarchical "N.M" pattern below),
+scanned with **no distance limit**. This is deliberately advisory, not
+assertive, unlike `nest_numbered_headings`: a false-positive marker match
+here only ever offers the VLM one extra, likely-ignorable HEADING_PARENT
+candidate — it can never assert a wrong PARENT_OF edge by itself the way a
+false positive in a deterministic reparenting function would, which is
+exactly why it's safe to recognize a looser "bare numbered section" pattern
+here than `nest_numbered_headings` would ever reparent on its own.
+
 **Caption/reference exclusion** (`_caption_or_reference_source_ids`,
 consumed by `_propose_text_heading_parents`'s `excluded_candidate_ids`): a
 Text already judged — deterministically (`caption_prefix_edges`/
@@ -913,6 +937,7 @@ def _build_document_context_windows(
         windows = build_context_windows(
             content, window=window, anchor_types=anchor_types, boundary_types=boundary_types
         )
+        windows = _widen_with_open_headings(content, windows)
         # Table/Image still need their caption/reference judgment. Their native
         # parents are protected again at application time.
         return [(anchor, candidates) for anchor, candidates in windows
@@ -1070,6 +1095,107 @@ def _propose_for_anchor(
     # a wrong reparenting is worse than none, so don't guess which to trust.
     heading_choice = heading_picks[0] if len(heading_picks) == 1 else None
     return edges, heading_choice
+
+
+# ---------------------------------------------------------------------------
+# Open-heading window widening (docx/pdf) — CONTEXT_WINDOW is a small, fixed
+# lookback/lookahead count (see build_context_windows's docstring), so a
+# section with more paragraphs than the window holds can push its own true
+# ancestor heading out of a later paragraph's candidate list entirely, no
+# matter how far the window is widened for THAT paragraph alone — the
+# problem is distance, not window size. Confirmed on a real PDF (a 2025 government
+# press release): "③ 안전 약자 보호 사각지대 해소" correctly found its immediate
+# parent "< 핵심 정책과제 >" (close enough to be in-window), but "< 핵심 정책과제 >"
+# itself never found ITS parent "1. 국민안전: ..." — several paragraphs further
+# back, well outside any reasonably-sized window — and was left a flat
+# Artifact child instead. Unlike `_widen_row_sibling_windows` (borrows
+# candidates from row-siblings, xlsx-only), this widens every anchor with
+# the *nearest preceding occurrence of each recognized structural-marker
+# family*, scanned with no distance limit at all.
+#
+# Deliberately advisory, not assertive: unlike `nest_numbered_headings`
+# (which reparents on its own, no VLM), a false-positive marker match here
+# only ever adds one extra, likely-ignorable HEADING_PARENT candidate for
+# the VLM to consider — it can't wrongly assert a PARENT_OF edge by itself.
+# That's what makes it safe to recognize markers `nest_numbered_headings`
+# itself doesn't (a bare "1. Title" top-level section, with no ".M" part —
+# see `_OPEN_NUMBERED_SECTION_RE`): a false positive there is just a mostly
+# poor candidate offered to the VLM, not a wrongly-forced edge.
+# ---------------------------------------------------------------------------
+
+_OPEN_HEADING_MAX_LEN = 60  # a real heading is short; a body/table cell that happens to start with a matching marker runs much longer — confirmed on a real xlsx cell, "1. 사용 전동 드라이버 / : Bosch BSB 12-2 Professional (1~22단) / 2. 측정 Torque 게이지 / ..." (145 chars, several "N. "s concatenated in one cell) vs. this PDF's real numbered section headings (8-34 chars)
+_OPEN_NUMBERED_SECTION_RE = re.compile(r"^(\d{1,2})[.\s]+(?!\d)\S")  # a bare or dot-terminated top-level number ("1 Title" / "1. Title") — Latin or not; nest_numbered_headings's own hierarchical "N.M" pattern (a stronger, deterministic-reparenting signal) is untouched and unaffected by this
+_CIRCLED_NUMBER_RE = re.compile(r"^[①-⑳]")  # U+2460-2473 — a Unicode block reserved for enumeration, essentially never appearing as ordinary punctuation
+_BRACKET_LABEL_RE = re.compile(r"^<[^<>]{1,40}>$")  # the *entire* text wrapped in "< ... >" (a short page-local label like "< 핵심 정책과제 >"), not just containing angle brackets somewhere mid-sentence
+
+
+def _open_heading_marker_families(text: str) -> tuple[str, ...]:
+    """Which of the "safe" structural-marker families (see the module
+    section above) this heading-candidate text belongs to — a node can
+    belong to more than one (rare). Purely advisory: see this section's
+    module-level comment for why a false positive here is low-risk."""
+    stripped = text.strip()
+    if not stripped or len(stripped) > _OPEN_HEADING_MAX_LEN:
+        return ()
+    families = []
+    if _OPEN_NUMBERED_SECTION_RE.match(stripped):
+        families.append("numbered_section")
+    if _CIRCLED_NUMBER_RE.match(stripped):
+        families.append("circled_number")
+    if _BRACKET_LABEL_RE.match(stripped):
+        families.append("bracket_label")
+    return tuple(families)
+
+
+def _widen_with_open_headings(
+    content: list[Node], windows: list[tuple[Node, list[Node]]]
+) -> list[tuple[Node, list[Node]]]:
+    """For each anchor, adds (deduplicated) the nearest preceding Text node
+    matching each open-heading marker family — scanned across the whole of
+    `content` with no distance limit, unlike `windows`' own bounded
+    candidates. `content` must be in document order (the same list passed to
+    `build_context_windows`) so "nearest preceding" is well-defined. An
+    anchor with no qualifying marker before it anywhere (or not found in
+    `content` at all) is returned with its candidates unchanged.
+
+    A `numbered_section` anchor (a top-level "1 Title"/"1. Title") only gets
+    a `numbered_section` bonus, never `circled_number`/`bracket_label` —
+    confirmed on the same real PDF this widening was built for: a *later*
+    top-level section ("2. 지방시대...") was offered an *earlier* section's
+    own "< 핵심 정책과제 >" label (identical text repeated once per section,
+    so "nearest preceding" reached backward across a whole earlier section)
+    as a bonus candidate, and the VLM wrongly nested the later section under
+    it instead of leaving both as Artifact-level siblings. A top-level
+    numbered section is the root of its own subtree; a page-local label from
+    a *previous* section is never its real parent, so that bonus family is
+    suppressed there specifically — unlike a `circled_number`/`bracket_label`
+    anchor, which is exactly the shape of thing a bonus `bracket_label`/
+    `numbered_section` candidate should legitimately be offered to."""
+    id_to_index = {n.id: i for i, n in enumerate(content)}
+    last_by_family: dict[str, Node] = {}
+    open_heading_before: list[dict[str, Node]] = []
+    for node in content:
+        open_heading_before.append(dict(last_by_family))
+        if node.type == NodeType.TEXT:
+            for family in _open_heading_marker_families(node.properties.get("text", "")):
+                last_by_family[family] = node
+
+    widened = []
+    for anchor, candidates in windows:
+        index = id_to_index.get(anchor.id)
+        available = open_heading_before[index] if index is not None else {}
+        anchor_families = _open_heading_marker_families(anchor.properties.get("text", ""))
+        bonus_families = ("numbered_section",) if "numbered_section" in anchor_families else available.keys()
+        seen_ids = {c.id for c in candidates}
+        seen_ids.add(anchor.id)
+        merged = list(candidates)
+        for family in bonus_families:
+            node = available.get(family)
+            if node is not None and node.id not in seen_ids:
+                seen_ids.add(node.id)
+                merged.append(node)
+        widened.append((anchor, merged))
+    return widened
 
 
 def _widen_row_sibling_windows(

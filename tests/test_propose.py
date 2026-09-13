@@ -24,7 +24,9 @@ from articling.relations.propose import (  # noqa: E402
     _SemanticRegionBatchResult, _SemanticRegionDecision, _SemanticTextGroup,
     _SiblingRegionBatchResult, _SiblingRegionDecision, _SyntheticGroupCandidate,
     _build_document_context_windows, _enumerated_sibling_groups, _find_same_line_text_clusters,
-    _find_semantic_text_regions, _propose_for_anchor, _propose_text_heading_parents, _widen_row_sibling_windows,
+    _find_semantic_text_regions, _open_heading_marker_families, _OPEN_HEADING_MAX_LEN,
+    _propose_for_anchor, _propose_text_heading_parents, _widen_row_sibling_windows,
+    _widen_with_open_headings,
     apply_vlm_enrichment, build_context_windows, merge_fragmented_text,
     merge_semantic_text_groups, nest_numbered_headings,
     propose_edges, propose_synthetic_groups, resolve_ambiguous_captions,
@@ -1404,6 +1406,84 @@ def test_widen_row_sibling_windows_includes_table_not_just_image() -> None:
     after = {a.id: {c.id for c in cands} for a, cands in widened}
 
     assert "heading" in after["tbl_crowded"], "the crowded table must inherit the heading from its row-sibling image"
+
+
+def test_open_heading_marker_families_recognizes_safe_markers() -> None:
+    """Each recognized "safe" structural-marker family (see
+    `_widen_with_open_headings`'s module-level comment), plus the negative
+    cases they're deliberately narrow to exclude."""
+    assert _open_heading_marker_families("1. 국민안전: 어디서나, 안전한 일상을 보장받는 국민") == ("numbered_section",)
+    assert _open_heading_marker_families("3 Model Architecture") == ("numbered_section",)
+    assert _open_heading_marker_families("① 재난상황을 빈틈없이 관리") == ("circled_number",)
+    assert _open_heading_marker_families("< 핵심 정책과제 >") == ("bracket_label",)
+    # not the *entire* text wrapped — a body sentence merely containing angle
+    # brackets somewhere isn't a page-local label.
+    assert _open_heading_marker_families("설명(<참고> 링크 포함) 이어지는 문장") == ()
+    # a real xlsx cell (this session, WindowFit review doc): several "N. "s
+    # concatenated in one long cell, not a heading — the length cap rejects it.
+    long_cell = (
+        "1. 사용 전동 드라이버 / : Bosch BSB 12-2 Professional (1~22단) / 2. 측정 Torque 게이지 / "
+        ": 블루텍 DG-TD230 / 3. 측정 결과 / → 전동드라이버 최고 Torque 22단(약 42kgf·㎝)에서도 파손 없음"
+    )
+    assert len(long_cell) > _OPEN_HEADING_MAX_LEN
+    assert _open_heading_marker_families(long_cell) == ()
+    # a table data row starting with a digit-then-digit must not qualify either.
+    assert _open_heading_marker_families("1 512 512 5.29 24.9") == ()
+
+
+def test_build_document_context_windows_widens_pdf_anchor_with_distant_open_heading() -> None:
+    """Regression (found on a real PDF this session, a 2025 government press
+    release): a subsection several paragraphs into a long section correctly
+    finds its immediate local parent, but that parent's *own* true ancestor
+    heading sits further back than any reasonably-sized window reaches —
+    reproduced here with `window=3` and 5 filler paragraphs in between."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="art1", properties={})
+    numbered_section = _text("h1", "1. 국민안전: 어디서나, 안전한 일상을 보장받는 국민")
+    fillers = [_text(f"filler{i}", f"filler paragraph {i}") for i in range(5)]
+    bracket_anchor = _text("bracket", "< 핵심 정책과제 >")
+    content = [numbered_section, *fillers, bracket_anchor]
+    doc = ArticDocument(
+        source_path="x", format="pdf",
+        nodes=[art1, *content],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id) for n in content],
+    )
+
+    windows = _build_document_context_windows(
+        doc, window=3, anchor_types=(NodeType.TEXT,), boundary_types=()
+    )
+    candidates_by_anchor = {a.id: {c.id for c in cands} for a, cands in windows}
+
+    assert "h1" in candidates_by_anchor["bracket"], (
+        "the distant numbered-section heading must be offered as a candidate even though "
+        "it's well outside the bounded window"
+    )
+
+
+def test_widen_with_open_headings_does_not_offer_bracket_label_to_a_numbered_section_anchor() -> None:
+    """Regression (found via a real end-to-end run on the same PDF as the
+    test above, after the widening fix landed): a *later* top-level numbered
+    section ("2. Title B") was offered an *earlier* section's own
+    "< Label >" (the exact same page-local label text repeats once per
+    section) as a bonus HEADING_PARENT candidate, and the VLM wrongly nested
+    the later section under it instead of leaving both as Artifact-level
+    siblings — a top-level numbered section is the root of its own subtree,
+    never a page-local label's child. `numbered_section` bonuses (for a
+    genuinely nested "1.1"-style case) are still offered; only
+    `circled_number`/`bracket_label` are suppressed for this anchor kind."""
+    section1 = _text("s1", "1 Title A")
+    bracket1 = _text("b1", "< Label >")
+    fillers = [_text(f"filler{i}", f"filler paragraph {i}") for i in range(5)]
+    section2 = _text("s2", "2 Title B")
+    content = [section1, bracket1, *fillers, section2]
+
+    windows = build_context_windows(content, window=3, anchor_types=(NodeType.TEXT,), boundary_types=())
+    widened = _widen_with_open_headings(content, windows)
+    candidates_by_anchor = {a.id: {c.id for c in cands} for a, cands in widened}
+
+    assert "b1" not in candidates_by_anchor["s2"], (
+        "a numbered-section anchor must not be offered a distant, different-section "
+        "bracket-label as a HEADING_PARENT candidate"
+    )
 
 
 def test_propose_edges_attaches_pptx_slide_pixels(tmp_path: Path) -> None:
