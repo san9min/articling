@@ -14,6 +14,16 @@ apply with no checkbox. Even on failure (rare, since it's a deterministic
 step) only a warning shows in the summary bar and the rest of the result is
 returned normally.
 
+Every format also always has `relations.propose.nest_numbered_headings`
+(nests "3.1" under "3" by text pattern alone) on for the same reason — pure
+text matching needing no VLM/API key, see the function's own docstring
+(see [docs/extraction-details.md](../docs/extraction-details.md) "DOCX and
+numbered headings"). It used to run only as part of `apply_vlm_enrichment`,
+leaving a user with no `OPENAI_API_KEY` with none of this free structure;
+it's still called again inside `apply_vlm_enrichment` when VLM enrichment is
+on, since that call's own HEADING_PARENT reparenting can move a numbered
+heading to a new section that this earlier call couldn't see yet.
+
 Turning on the `vlm_enrichment` option (one checkbox in the frontend, off
 by default) runs `relations.propose.apply_vlm_enrichment(doc)` right after
 extraction, applying every VLM-based enrichment — the same behavior as the
@@ -344,6 +354,21 @@ def extract_document(
         raise HTTPException(500, f"Extraction failed: {exc}") from exc
 
     warnings: list[str] = []
+
+    # Needs no VLM/API key — pure text pattern matching ("3.1" under "3"),
+    # see nest_numbered_headings's own docstring — so, like PDF vector
+    # figure detection below, it's applied unconditionally to every format
+    # here, not gated behind the "VLM enrichment" checkbox. Still re-run
+    # inside apply_vlm_enrichment when that checkbox is on (see its
+    # docstring): its own HEADING_PARENT reparenting can move a numbered
+    # heading to a new section, which this call alone can't see yet.
+    try:
+        from articling.relations.propose import nest_numbered_headings
+
+        nest_numbered_headings(doc)
+    except Exception as exc:  # noqa: BLE001 — a deterministic step, but a failure doesn't block the whole thing
+        traceback.print_exc()
+        warnings.append(f"Numbered-heading nesting failed (returning the graph as extracted): {exc!r}")
 
     if suffix == ".pdf":
         # detects figures drawn as vector graphics (plots/heatmaps etc.,

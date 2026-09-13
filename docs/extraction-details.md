@@ -51,6 +51,21 @@ Artifact. Native Word list identities do not bridge heading or parent
 boundaries, and `numId=0` is treated as numbering removal. Both heading
 reparenting and graph checks now guard against parent cycles.
 
+### Numbered-heading nesting is not DOCX-only, and needs no VLM
+
+`relations.propose.nest_numbered_headings` (nests a "3.1 Title" Text node
+under its "3 Title" section by text pattern alone — see the function's own
+docstring for the table-data-row safeguard) applies to any format's Text
+nodes, not just DOCX. It needs no VLM/API key, so both the CLI and the demo
+app run it unconditionally right after extraction, independent of
+`--vlm-enrichment`/the "VLM enrichment" checkbox — a user with no
+`OPENAI_API_KEY` still gets this structure for free. It is *also* still run
+a second time inside `relations.propose.apply_vlm_enrichment` when VLM
+enrichment is on, since that call's own HEADING_PARENT judgment can move a
+numbered heading to a different section that the earlier, pre-VLM call
+couldn't see yet; the second call is a no-op wherever the first already put
+a node under the right parent.
+
 ## PDF
 
 PDF extraction also restores tightly adjacent horizontal single-line text

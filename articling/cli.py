@@ -16,6 +16,7 @@ from pathlib import Path
 from . import extract
 from .export.json_export import to_json
 from .export.neo4j import to_cypher_script
+from .relations.propose import nest_numbered_headings
 from .scaffold import check_invariants
 
 
@@ -30,8 +31,9 @@ def main(argv: list[str] | None = None) -> int:
             "run relations.propose.apply_vlm_enrichment — merge semantic Text groups from the 2D layout and same-line fragments, "
             "propose CAPTION_OF/REFERENCES and reparent heading Text as parents in the same call (propose_edges, "
             "include_text_anchors=True; a flat '1)/2)/3)...' enumerated-sibling run is asked about once and applied to "
-            "every member, not asked once per member), add the CAPTION_OF/REFERENCES proposals to the edges, then nest "
-            "numbered subheadings under their section (nest_numbered_headings) (requires OPENAI_API_KEY)"
+            "every member, not asked once per member), add the CAPTION_OF/REFERENCES proposals to the edges, then re-nest "
+            "numbered subheadings under their section (nest_numbered_headings, already run once on the base graph — see "
+            "below — but re-run here to catch a section HEADING_PARENT just moved) (requires OPENAI_API_KEY)"
         ),
     )
     parser.add_argument("--check", action="store_true", help="check scaffold invariants (PARENT_OF/NEXT integrity) and report to stderr")
@@ -47,6 +49,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--trace-dir requires --vlm-enrichment")
 
     document = extract(args.path)
+    # Needs no VLM/API key — pure text pattern matching ("3.1" under "3"),
+    # see nest_numbered_headings's own docstring — so it belongs to the base
+    # graph unconditionally, not gated behind --vlm-enrichment. Kept in the
+    # --vlm-enrichment bundle too (see apply_vlm_enrichment): its own
+    # HEADING_PARENT reparenting can move a numbered heading to a new
+    # section, which this call alone (running before that) can't see yet.
+    nest_numbered_headings(document)
 
     if args.vlm_enrichment:
         from .relations.propose import DEFAULT_MODEL, apply_vlm_enrichment

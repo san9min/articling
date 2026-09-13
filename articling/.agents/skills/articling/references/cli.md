@@ -11,6 +11,14 @@ python -m articling.cli PATH [--format json|cypher] [-o OUTPUT] [--vlm-enrichmen
 - `--format cypher` — a full Cypher script (`CREATE` statements + optional
   uniqueness constraints) via `export.neo4j.to_cypher_script`.
 - `-o/--output` — write to a file; omit to print to stdout.
+- Right after extraction, **before** `--vlm-enrichment` is even considered,
+  the CLI always runs `relations.propose.nest_numbered_headings(document)` —
+  it nests a numbered subsection heading ("3.1 Title") under its section
+  ("3 Title") by text-pattern matching alone (a different, hierarchical
+  "N.M" pattern from the flat "1)/2)/3)..." run below). This needs no
+  VLM/API key/`relations` extra, so it's unconditional and applies to every
+  format, not just DOCX — the same treatment
+  `extractors.pdf_figures.enrich_pdf_figures` gets in the demo app.
 - `--vlm-enrichment` — after extraction, run
   `relations.propose.apply_vlm_enrichment(document)`, which (in order)
   first merges semantic PDF `Text` units from numbered 2D layout regions
@@ -27,18 +35,17 @@ python -m articling.cli PATH [--format json|cypher] [-o OUTPUT] [--vlm-enrichmen
   member's own candidate window — rather than one independent question per
   member that a small candidate-window limit could push out of range for a
   later member (or that could simply disagree with an earlier one); the
-  single answer is then applied to every member. Finally it
-  nests numbered subsection headings under their section
-  (`nest_numbered_headings` — a different, hierarchical "N.M" pattern,
-  text-pattern matching, no model call).
-  Requires `OPENAI_API_KEY` and `pip install "articling[relations]"` (still
-  true even though `nest_numbered_headings` itself needs neither, since
-  it's bundled here). Heading reparenting/nesting rewrites deterministic
-  `PARENT_OF` structure and fragment merging removes nodes — flag both as
-  model-derived when reporting results (`nest_numbered_headings`'s part is
-  deterministic, not a proposal, but still a rewrite worth mentioning),
-  same as the CAPTION_OF/REFERENCES proposals (not confirmed
-  edges). Need only one part of this? Call `merge_fragmented_text`,
+  single answer is then applied to every member. Finally it re-runs
+  `nest_numbered_headings` — a no-op wherever the earlier, unconditional
+  call above already put a node under the right parent, but this second
+  pass catches a numbered heading that HEADING_PARENT just moved to a
+  different section, which the first (pre-VLM) call couldn't see yet.
+  Requires `OPENAI_API_KEY` and `pip install "articling[relations]"` (the
+  bundle's other three steps need it even though `nest_numbered_headings`
+  itself doesn't). Heading reparenting rewrites deterministic `PARENT_OF`
+  structure and fragment merging removes nodes — flag both as model-derived
+  when reporting results, same as the CAPTION_OF/REFERENCES proposals (not
+  confirmed edges). Need only one part of this? Call `merge_fragmented_text`,
   `propose_edges` (with or without `include_text_anchors`),
   or `nest_numbered_headings` directly from the
   SDK instead — see [relations.md](relations.md).
