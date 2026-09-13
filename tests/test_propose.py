@@ -24,7 +24,9 @@ from articling.relations.propose import (  # noqa: E402
     _SemanticRegionBatchResult, _SemanticRegionDecision, _SemanticTextGroup,
     _SiblingRegionBatchResult, _SiblingRegionDecision, _SyntheticGroupCandidate,
     _build_document_context_windows, _enumerated_sibling_groups, _find_same_line_text_clusters,
-    _find_semantic_text_regions, _propose_for_anchor, _propose_text_heading_parents, _widen_row_sibling_windows,
+    _find_semantic_text_regions, _open_heading_marker_families, _OPEN_HEADING_MAX_LEN,
+    _propose_for_anchor, _propose_text_heading_parents, _widen_row_sibling_windows,
+    _widen_with_confirmed_headings, _widen_with_open_headings,
     apply_vlm_enrichment, build_context_windows, merge_fragmented_text,
     merge_semantic_text_groups, nest_numbered_headings,
     propose_edges, propose_synthetic_groups, resolve_ambiguous_captions,
@@ -197,6 +199,28 @@ class _ShapeAwareResponses:
 class _ShapeAwareClient:
     def __init__(self, results_by_type: dict):
         self.responses = _ShapeAwareResponses(results_by_type)
+
+
+class _SequentialResponses:
+    """Returns a different fixed result per call, in call order — for a
+    test where a later call's request depends on an earlier call's already-
+    applied effect (e.g. `propose_edges`'s pass-2 retry, which only builds
+    its windows after pass 1's reparents are applied to `document`), unlike
+    `_FakeClient` (same result every call) or `_ShapeAwareResponses`
+    (dispatches by request schema, not call order)."""
+
+    def __init__(self, results: list):
+        self._results = results
+        self.calls: list[dict] = []
+
+    def parse(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeResponse(self._results[len(self.calls) - 1])
+
+
+class _SequentialClient:
+    def __init__(self, results: list):
+        self.responses = _SequentialResponses(results)
 
 
 def _image_node(id_: str, name: str, image_path: str) -> Node:
@@ -375,6 +399,59 @@ def test_propose_edges_skips_reparent_that_would_create_cycle() -> None:
     assert doc.edges == edges, "the original structure must be preserved as-is"
     assert check_invariants(doc.nodes, doc.edges) == []
     assert len(client.responses.calls) == 1, "the 2 pixel-less anchors must be processed as one batch (1 call)"
+
+
+def test_propose_edges_retries_flat_text_anchor_with_confirmed_heading_from_pass_one() -> None:
+    """Pass 2 (`_retry_flat_text_anchors_with_confirmed_headings`): a
+    heading with no recognizable marker at all ("Overview Section" — no
+    number/circle/bracket, so `_widen_with_open_headings` can't help it
+    either) sits too far from a later paragraph for pass 1's own window to
+    ever offer it as a candidate. Pass 1 *does* confirm it's a real heading
+    by reparenting a closer paragraph under it, though — pass 2 then offers
+    that now-confirmed heading to the distant paragraph too, resolving it
+    without ever threading state through the model itself (each pass is
+    still an independent, concurrent judgment — see the module comment
+    above `_widen_with_confirmed_headings`)."""
+    section1 = _text("section1", "Overview Section")
+    local_subsection = _text("local", "Local subsection")
+    fillers = [_text(f"filler{i}", f"filler paragraph {i}") for i in range(5)]
+    distant_anchor = _text("distant", "Far paragraph")
+    content = [section1, local_subsection, *fillers, distant_anchor]
+    doc = ArticDocument(
+        source_path="x", format="pdf",
+        nodes=[Node(id="art1", type=NodeType.ARTIFACT, name="art1"), *content],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id) for n in content],
+    )
+
+    # Pass 1 batch anchor order follows content order: section1=0, local=1,
+    # filler0..4=2..6, distant=7. `local`'s own window=3 candidates are
+    # [section1, filler0, filler1] (only section1 sits to its left) —
+    # parent_index 0 picks section1. `distant`'s own candidates are
+    # [filler2, filler3, filler4] (window=3 can't reach back past the 5
+    # fillers) — no choice entry for it, so it's left flat, as intended.
+    pass1_result = _HeadingParentBatchResult(
+        choices=[_HeadingParentChoice(anchor_index=1, parent_index=0, rationale="Overview Section 소속")]
+    )
+    # After pass 1 is applied, "section1" is a confirmed heading (it's
+    # `local`'s real parent now). Pass 2 retries every still-flat anchor
+    # whose widened candidates actually gained something new: filler0/
+    # filler1 already had section1 in their own window during pass 1 (close
+    # enough), so they're excluded; filler2/filler3/filler4/distant weren't
+    # — batch order filler2=0, filler3=1, filler4=2, distant=3. `distant`'s
+    # *widened* candidates are [filler2, filler3, filler4, section1] —
+    # parent_index 3 picks section1.
+    pass2_result = _HeadingParentBatchResult(
+        choices=[_HeadingParentChoice(anchor_index=3, parent_index=3, rationale="Overview Section 소속 (2차)")]
+    )
+    client = _SequentialClient([pass1_result, pass2_result])
+
+    propose_edges(doc, client=client, window=3, include_text_anchors=True)
+
+    assert set(_reparented_ids(doc)) == {"local", "distant"}
+    parent_of_distant = next(e for e in doc.edges if e.type == EdgeType.PARENT_OF and e.target_id == "distant")
+    assert parent_of_distant.source_id == "section1"
+    assert len(client.responses.calls) == 2, "pass 1 and pass 2 must each be exactly one batch call"
+    assert check_invariants(doc.nodes, doc.edges) == []
 
 
 def test_propose_edges_processes_table_and_text_only_anchors_separately(tmp_path: Path) -> None:
@@ -1404,6 +1481,110 @@ def test_widen_row_sibling_windows_includes_table_not_just_image() -> None:
     after = {a.id: {c.id for c in cands} for a, cands in widened}
 
     assert "heading" in after["tbl_crowded"], "the crowded table must inherit the heading from its row-sibling image"
+
+
+def test_open_heading_marker_families_recognizes_safe_markers() -> None:
+    """Each recognized "safe" structural-marker family (see
+    `_widen_with_open_headings`'s module-level comment), plus the negative
+    cases they're deliberately narrow to exclude."""
+    assert _open_heading_marker_families("1. 국민안전: 어디서나, 안전한 일상을 보장받는 국민") == ("numbered_section",)
+    assert _open_heading_marker_families("3 Model Architecture") == ("numbered_section",)
+    assert _open_heading_marker_families("① 재난상황을 빈틈없이 관리") == ("circled_number",)
+    assert _open_heading_marker_families("< 핵심 정책과제 >") == ("bracket_label",)
+    # not the *entire* text wrapped — a body sentence merely containing angle
+    # brackets somewhere isn't a page-local label.
+    assert _open_heading_marker_families("설명(<참고> 링크 포함) 이어지는 문장") == ()
+    # a real xlsx cell (this session, WindowFit review doc): several "N. "s
+    # concatenated in one long cell, not a heading — the length cap rejects it.
+    long_cell = (
+        "1. 사용 전동 드라이버 / : Bosch BSB 12-2 Professional (1~22단) / 2. 측정 Torque 게이지 / "
+        ": 블루텍 DG-TD230 / 3. 측정 결과 / → 전동드라이버 최고 Torque 22단(약 42kgf·㎝)에서도 파손 없음"
+    )
+    assert len(long_cell) > _OPEN_HEADING_MAX_LEN
+    assert _open_heading_marker_families(long_cell) == ()
+    # a table data row starting with a digit-then-digit must not qualify either.
+    assert _open_heading_marker_families("1 512 512 5.29 24.9") == ()
+
+
+def test_build_document_context_windows_widens_pdf_anchor_with_distant_open_heading() -> None:
+    """Regression (found on a real PDF this session, a 2025 government press
+    release): a subsection several paragraphs into a long section correctly
+    finds its immediate local parent, but that parent's *own* true ancestor
+    heading sits further back than any reasonably-sized window reaches —
+    reproduced here with `window=3` and 5 filler paragraphs in between."""
+    art1 = Node(id="art1", type=NodeType.ARTIFACT, name="art1", properties={})
+    numbered_section = _text("h1", "1. 국민안전: 어디서나, 안전한 일상을 보장받는 국민")
+    fillers = [_text(f"filler{i}", f"filler paragraph {i}") for i in range(5)]
+    bracket_anchor = _text("bracket", "< 핵심 정책과제 >")
+    content = [numbered_section, *fillers, bracket_anchor]
+    doc = ArticDocument(
+        source_path="x", format="pdf",
+        nodes=[art1, *content],
+        edges=[Edge(type=EdgeType.PARENT_OF, source_id="art1", target_id=n.id) for n in content],
+    )
+
+    windows = _build_document_context_windows(
+        doc, window=3, anchor_types=(NodeType.TEXT,), boundary_types=()
+    )
+    candidates_by_anchor = {a.id: {c.id for c in cands} for a, cands in windows}
+
+    assert "h1" in candidates_by_anchor["bracket"], (
+        "the distant numbered-section heading must be offered as a candidate even though "
+        "it's well outside the bounded window"
+    )
+
+
+def test_widen_with_open_headings_does_not_offer_bracket_label_to_a_numbered_section_anchor() -> None:
+    """Regression (found via a real end-to-end run on the same PDF as the
+    test above, after the widening fix landed): a *later* top-level numbered
+    section ("2. Title B") was offered an *earlier* section's own
+    "< Label >" (the exact same page-local label text repeats once per
+    section) as a bonus HEADING_PARENT candidate, and the VLM wrongly nested
+    the later section under it instead of leaving both as Artifact-level
+    siblings — a top-level numbered section is the root of its own subtree,
+    never a page-local label's child. `numbered_section` bonuses (for a
+    genuinely nested "1.1"-style case) are still offered; only
+    `circled_number`/`bracket_label` are suppressed for this anchor kind."""
+    section1 = _text("s1", "1 Title A")
+    bracket1 = _text("b1", "< Label >")
+    fillers = [_text(f"filler{i}", f"filler paragraph {i}") for i in range(5)]
+    section2 = _text("s2", "2 Title B")
+    content = [section1, bracket1, *fillers, section2]
+
+    windows = build_context_windows(content, window=3, anchor_types=(NodeType.TEXT,), boundary_types=())
+    widened = _widen_with_open_headings(content, windows)
+    candidates_by_anchor = {a.id: {c.id for c in cands} for a, cands in widened}
+
+    assert "b1" not in candidates_by_anchor["s2"], (
+        "a numbered-section anchor must not be offered a distant, different-section "
+        "bracket-label as a HEADING_PARENT candidate"
+    )
+
+
+def test_widen_with_confirmed_headings_does_not_offer_bonus_to_a_numbered_section_anchor() -> None:
+    """The same guard as `_widen_with_open_headings`'s, for pass 2. Regression
+    (found via a real end-to-end run on the same PDF, after pass 2 landed):
+    a top-level numbered section ("1. 국민안전...") was left flat by pass 1
+    (correctly — it's a numbered_section anchor, so it never gets an
+    out-of-family bonus there), but pass 2 had no such restriction and
+    offered it a confirmed heading from *outside* its own family
+    ("< 2025년 주요 추진과제 >", confirmed only because pass 1 attached an
+    unrelated Image caption under it) — the VLM accepted it, nesting one
+    top-level section under a page-local label while its numbered siblings
+    correctly stayed root siblings, an inconsistent tree."""
+    overview_label = _text("overview", "Overview Label")
+    fillers = [_text(f"filler{i}", f"filler paragraph {i}") for i in range(5)]
+    numbered_anchor = _text("s1", "1 Title A")
+    content = [overview_label, *fillers, numbered_anchor]
+
+    windows = build_context_windows(content, window=3, anchor_types=(NodeType.TEXT,), boundary_types=())
+    widened = _widen_with_confirmed_headings(content, windows, confirmed_heading_ids={"overview"})
+    candidates_by_anchor = {a.id: {c.id for c in cands} for a, cands in widened}
+
+    assert "overview" not in candidates_by_anchor["s1"], (
+        "a numbered-section anchor must not be offered a confirmed heading from "
+        "outside its own family as a HEADING_PARENT candidate"
+    )
 
 
 def test_propose_edges_attaches_pptx_slide_pixels(tmp_path: Path) -> None:

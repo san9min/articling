@@ -253,6 +253,74 @@ REFERENCES eligibility is computed before this widening and never touched
 by it, so a candidate borrowed only from a sibling's window still can't
 become *this* anchor's own caption/reference.
 
+### Open-heading window widening (docx/pdf)
+
+Row-sibling widening above still leaves every anchor's own window bounded
+by `CONTEXT_WINDOW` in document order — a section with more paragraphs than
+the window holds can push its own true ancestor heading out of a *later*
+paragraph's candidates entirely, no matter the window size, since the
+problem is distance, not count. Confirmed on a real PDF (a 2025 government
+press release, no PDF bookmarks at all): a subsection heading correctly
+found its immediate parent (close enough to be in-window), but that parent
+itself never found *its* own parent — several paragraphs further back —
+and was left a flat Artifact child instead, with everything under it
+inheriting the same fate (87 of 174 content nodes ended up as flat Artifact
+children).
+
+Fix (`_widen_with_open_headings`): every anchor's candidates are widened
+with the nearest preceding occurrence of each recognized "safe"
+structural-marker family — a circled number like "①", a short "< label >"
+fully wrapped in angle brackets, or a bare/dot-terminated top-level
+numbered section like "1." or "1 Title" (Latin or not, distinct from
+`nest_numbered_headings`'s own hierarchical "N.M" pattern) — scanned with
+**no distance limit**. This is deliberately advisory, not assertive, unlike
+`nest_numbered_headings`: a false-positive marker match here only ever
+offers the VLM one extra, likely-ignorable HEADING_PARENT candidate, never
+a wrongly-asserted edge, which is exactly why it's safe to recognize a
+looser "bare numbered section" pattern here than deterministic reparenting
+ever would.
+
+A numbered-section anchor only ever receives a `numbered_section` bonus,
+never `circled_number`/`bracket_label` — confirmed on the same PDF: a
+*later* top-level section was offered an *earlier* section's own repeated
+"< label >" text (the identical label repeats once per section) and got
+wrongly nested under it. A top-level numbered section is the root of its
+own subtree, never a previous section's label's child.
+
+### Second-pass confirmed-heading retry (docx/pdf)
+
+The widening above only recognizes a small, deliberately narrow set of text
+patterns — a real heading with no such marker at all (arbitrary
+bold/large-font text, no number/circle/bracket) still depends purely on
+`window` and can still be missed by distance alone. But once pass 1 (the
+Text-anchor HEADING_PARENT pass) has run and its reparents are applied,
+*some* of those unmarked headings are no longer guesses: any node pass 1
+actually reparented a child under is now a **deterministically confirmed**
+heading, independent of whether it matches any text pattern.
+
+A second, automatic pass (`_retry_flat_text_anchors_with_confirmed_headings`)
+offers this expanded, still-growing set of confirmed headings to whatever
+Text anchor is still left flat, using the same distance-unlimited
+nearest-preceding-occurrence mechanism as the marker widening above
+(`_widen_with_confirmed_headings`). Only anchors where this bonus actually
+adds a genuinely new candidate are retried, so the extra cost scales with
+new opportunities, not with how many anchors happened to stay flat.
+
+This is deliberately a bounded, one-shot *pass* — every anchor within it is
+still judged independently and concurrently, exactly like pass 1 — **not**
+a running "current hierarchy" state threaded through the model call to
+call. That alternative was considered and rejected: it would break the
+independence `_propose_heading_parents_batch`'s own prompt insists on
+("evaluate each anchor independently"), letting one wrong judgment corrupt
+every later one's candidates with no way back, and it would serialize what
+currently runs concurrently via `ThreadPoolExecutor` — likely trading a
+smaller call count for *more* wall-clock time, not less (see "Batching and
+concurrency" above for the measured concurrency win this would give up).
+
+Re-verified against the same PDF after both fixes: flat Artifact children
+dropped to 44/168, with every repeated "< 핵심 정책과제 >" instance
+correctly attached to its own section.
+
 ### Caption/reference exclusion from HEADING_PARENT candidates
 
 A Text already judged — deterministically
